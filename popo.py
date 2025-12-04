@@ -613,7 +613,7 @@ class NorMuon(torch.optim.Optimizer):
                 # alpha=1.0 is standard Muon. alpha=0.5 allows spectral info to leak through.
                 # During the plateau, a lower alpha helps finding the specific direction for sparse features.
                 alpha = 0.8 
-                v_chunk = torch.lerp(v_raw, v_ortho, alpha)
+                v_chunk = torch.lerp(v_raw.to(v_ortho.dtype), v_ortho, alpha)
 
             # NorMuon: second_momentum_buffer tracks squared magnitude of gradients along one dim (https://arxiv.org/pdf/2510.05491)
             v_norm = v_chunk.norm(dim=(-2, -1), keepdim=True)
