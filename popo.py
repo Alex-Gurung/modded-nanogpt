@@ -1414,7 +1414,7 @@ def get_lr(step: int):
         lr = w * 1.0 + (1 - w) * 0.1
 
     if step > 400 and lr == 1.0:
-        lr = 1.0
+        lr = 2.0
 
     return lr
 
@@ -1455,8 +1455,8 @@ def step_optimizers(step: int, optimizers, model):
 
     # on even steps, only step Muon params
     # on odd steps, step all params
-    # if step%2==0:
-    if step%8==0:
+    if step%2==0:
+    # if step%8==0:
         optimizers[1].step()
         optimizers[1].zero_grad(set_to_none=True)
     else:
