@@ -366,13 +366,20 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     return out
 
 # Computed for num_iters=5, safety_factor=2e-2, cushion=2
+# polar_express_coeffs = [
+#     (8.156554524902461, -22.48329292557795, 15.878769915207462),
+#     (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+#     (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+#     (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+#     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+# ]
+
 polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+    (7.042591168351887, -19.546957500198477, 14.232214398877026),
+    (2.797801873285498, -2.1057054132897735, 0.4796317955107122),
+    (1.9725416536693654, -1.3424651687719673, 0.375275769476454),
 ]
+
 # polar_express_coeffs = [
 #     (7.706030141118669, -22.229473232552213, 16.16727804459456),
 #     (3.443374785630018, -2.7282730941305497, 0.5583110302049723),
@@ -1336,8 +1343,7 @@ gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = DistAdam(
-    # scalar_params + head_params + embed_params,
-    scalar_params + head_params + embed_params + gate_params,
+    scalar_params + head_params + embed_params,
     lr=0.008,
     # lr=0.016,
     betas=(0.65, 0.95),
@@ -1345,7 +1351,7 @@ optimizer1 = DistAdam(
     weight_decay=0.0,
 )
 # optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
-optimizer2 = NorMuon(hidden_matrix_params, lr=0.05, momentum=0.95, beta2=0.95, weight_decay=1.2)
+optimizer2 = NorMuon(hidden_matrix_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
 # optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.10, momentum=0.95, beta2=0.95, weight_decay=1.2)
 # optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.1, momentum=0.95, beta2=0.95, weight_decay=1.2)
 optimizers = [optimizer1, optimizer2]
