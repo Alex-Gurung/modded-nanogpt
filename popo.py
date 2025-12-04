@@ -13,10 +13,7 @@ from dataclasses import dataclass
 from collections import defaultdict
 from itertools import accumulate
 from pathlib import Path
-<<<<<<< HEAD
-=======
 import json
->>>>>>> 9e698273f4ae0d437674d32cccd0fbf9ae1feeb5
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -369,29 +366,12 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     return out
 
 # Computed for num_iters=5, safety_factor=2e-2, cushion=2
-<<<<<<< HEAD
-#polar_express_coeffs = [
-#    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-#    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-#    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-#    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-#    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
-#]
-
-polar_express_coeffs = [
-    (7.706030141118669, -22.229473232552213, 16.16727804459456),
-    (3.443374785630018, -2.7282730941305497, 0.5583110302049723),
-    (3.115515746565568, -2.8693827288726377, 0.75144940447043),
-    (2.295274606908728, -1.9765443440388453, 0.6464378616178528),
-    (1.8620648518207559, -1.21977185958322, 0.3580080821791749),
-=======
 polar_express_coeffs = [
     (8.156554524902461, -22.48329292557795, 15.878769915207462),
     (4.042929935166739, -2.808917465908714, 0.5000178451051316),
     (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
     (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
->>>>>>> 9e698273f4ae0d437674d32cccd0fbf9ae1feeb5
 ]
 
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
@@ -1290,10 +1270,7 @@ if master_process:
     run_id = args.run_id
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
-<<<<<<< HEAD
-=======
     loss_logfile = f"logs/{run_id}_loss.jsonl"
->>>>>>> 9e698273f4ae0d437674d32cccd0fbf9ae1feeb5
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -1302,8 +1279,6 @@ def print0(s, console=False):
                 print(s)
             print(s, file=f)
 
-<<<<<<< HEAD
-=======
 def log_loss_record(step: int, phase: str, loss_mean: float):
     if not master_process:
         return
@@ -1312,7 +1287,6 @@ def log_loss_record(step: int, phase: str, loss_mean: float):
     with open(loss_logfile, "a", encoding="utf-8") as f:
         f.write(line + "\n")
 
->>>>>>> 9e698273f4ae0d437674d32cccd0fbf9ae1feeb5
 # begin by printing this file (the Python code)
 print0(code)
 print0("="*100)
@@ -1495,10 +1469,7 @@ for step in range(train_steps + 1):
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-<<<<<<< HEAD
-=======
         log_loss_record(step, "val", val_loss.item() if hasattr(val_loss, "item") else float(val_loss))
->>>>>>> 9e698273f4ae0d437674d32cccd0fbf9ae1feeb5
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1513,34 +1484,24 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-<<<<<<< HEAD
-=======
     loss_accum = 0.0
->>>>>>> 9e698273f4ae0d437674d32cccd0fbf9ae1feeb5
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizer on the last iteration before we step it
         if idx == grad_accum_steps - 1 and step % 2 == 1:
             optimizers[0].should_sync = True
 
         inputs, targets, cum_seqlens = next(train_loader)
-<<<<<<< HEAD
-        (model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps).backward()
-=======
         loss_mb = model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps
         loss_accum += loss_mb.detach().item()
         loss_mb.backward()
->>>>>>> 9e698273f4ae0d437674d32cccd0fbf9ae1feeb5
     step_optimizers(step, optimizers, model)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
-<<<<<<< HEAD
-=======
     # per-token mean loss (approx): accumulated scaled loss * grad_accum_steps / global tokens
     train_loss_mean = loss_accum * grad_accum_steps / args.train_batch_size
     log_loss_record(step + 1, "train", train_loss_mean)
->>>>>>> 9e698273f4ae0d437674d32cccd0fbf9ae1feeb5
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
