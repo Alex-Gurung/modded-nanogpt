@@ -1367,6 +1367,7 @@ def _parse_reset_steps(val: str):
 
 OPT_RESET_STEPS = _parse_reset_steps(os.environ.get("OPT_RESET_STEPS", os.environ.get("OPT_RESET_STEP", "-1")))
 OPT_RESET_MODE = os.environ.get("OPT_RESET_MODE", "reset")  # "reset" or "adam"
+MOMENTUM_RESET_STEPS = _parse_reset_steps(os.environ.get("MOMENTUM_RESET_STEPS", "-1"))
 
 def make_optimizers(mode: str = "reset"):
     # opt2 always starts as NorMuon; only when mode=="adam" do we swap to AdamW at reset step
@@ -1388,6 +1389,19 @@ def make_optimizers(mode: str = "reset"):
         if not hasattr(opt, "should_sync"):
             opt.should_sync = False
     return new_opts
+
+
+def zero_optimizer_momentum(opt):
+    # For DistAdam: exp_avg / exp_avg_sq; for NorMuon: group buffers; generic tensors zeroed.
+    for state in opt.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                v.zero_()
+    for group in opt.param_groups:
+        for key in ("momentum_buffer", "second_momentum_buffer"):
+            buf = group.get(key, None)
+            if torch.is_tensor(buf):
+                buf.zero_()
 
 # learning rate schedule: flat, then linear decay, then flat
 def get_lr(step: int):
@@ -1498,8 +1512,18 @@ for step in range(train_steps + 1):
     last_step = (step == train_steps)
     if OPT_RESET_STEPS and step in OPT_RESET_STEPS:
         mode = "adam" if OPT_RESET_MODE.lower() == "adam" else "reset"
+        # free old optimizer state before swapping to avoid OOM spikes
+        old_opts = optimizers
+        optimizers = None
+        torch.cuda.empty_cache()
+        del old_opts
+        torch.cuda.empty_cache()
         optimizers = make_optimizers(mode)
         print0(f"Resetting optimizers at step {step} with mode={mode}", console=True)
+    if MOMENTUM_RESET_STEPS and step in MOMENTUM_RESET_STEPS:
+        for opt in optimizers:
+            zero_optimizer_momentum(opt)
+        print0(f"Zeroed optimizer momentum at step {step}", console=True)
     ws_short, new_ws_long = get_ws(step)
     if new_ws_long != ws_long:
         model.yarn.apply(ws_long, new_ws_long)
