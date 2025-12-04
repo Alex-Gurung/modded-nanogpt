@@ -1,3 +1,5 @@
+*.txt
+*.sh
 fineweb10B/
 pylog124M/
 __pycache__/
