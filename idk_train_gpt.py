@@ -1267,10 +1267,7 @@ class GPT(nn.Module):
         #   - optionally subsample tokens
         #   - keep only top-k log-probs + indices per token
         #   - move just that to CPU
-<<<<<<< HEAD
-=======
         # if ANALYSIS.enabled and not torch._dynamo.is_compiling():
->>>>>>> 9e698273f4ae0d437674d32cccd0fbf9ae1feeb5
         if ANALYSIS.enabled and not torch._dynamo.is_compiling():
             self._stash_analysis_view(logits_for_loss, target_seq)
 
