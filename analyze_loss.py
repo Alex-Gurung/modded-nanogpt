@@ -42,10 +42,11 @@ def plot_runs(df: pd.DataFrame, out_dir: Path):
         fig, ax = plt.subplots(figsize=(8, 5))
         for run, run_df in sub.groupby("run"):
             ax.plot(run_df["step"], run_df["loss"], label=run)
-        # even-spaced horizontal guides (default 0.1)
-        tick_step = 0.1
-        ax.yaxis.set_major_locator(mticker.MultipleLocator(tick_step))
+        # major ticks every 0.5, minor grid at 0.1
+        ax.yaxis.set_major_locator(mticker.MultipleLocator(0.5))
+        ax.yaxis.set_minor_locator(mticker.MultipleLocator(0.1))
         ax.grid(which="major", axis="y", linestyle="--", alpha=0.3)
+        ax.grid(which="minor", axis="y", linestyle=":", alpha=0.2)
         ax.set_xlabel("step")
         ax.set_ylabel(f"{phase} loss")
         ax.set_title(f"{phase} loss vs step")
