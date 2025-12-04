@@ -6,6 +6,7 @@ from typing import List
 
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 
 
 def load_logs(paths: List[str]) -> pd.DataFrame:
@@ -38,33 +39,21 @@ def plot_runs(df: pd.DataFrame, out_dir: Path):
         sub = df[df["phase"] == phase].sort_values("step")
         if sub.empty:
             continue
-        plt.figure(figsize=(8, 5))
+        fig, ax = plt.subplots(figsize=(8, 5))
         for run, run_df in sub.groupby("run"):
-            plt.plot(run_df["step"], run_df["loss"], label=run)
-        # reference lines: overall min/max and median per phase
-        y_vals = sub["loss"].to_numpy()
-        if y_vals.size > 0:
-            y_med = float(pd.Series(y_vals).median())
-            y_min = float(y_vals.min())
-            y_max = float(y_vals.max())
-            plt.axhline(y_med, color="gray", linestyle="--", alpha=0.6, label="median")
-            plt.axhline(y_min, color="gray", linestyle=":", alpha=0.4, label="min/max")
-            plt.axhline(y_max, color="gray", linestyle=":", alpha=0.4)
-        plt.xlabel("step")
-        plt.ylabel(f"{phase} loss")
-        plt.title(f"{phase} loss vs step")
-        # optional vertical guides at key steps (quartiles of logged steps)
-        steps = sub["step"].to_numpy()
-        if steps.size > 3:
-            qs = [0.25, 0.5, 0.75]
-            for q in qs:
-                s_q = float(pd.Series(steps).quantile(q))
-                plt.axvline(s_q, color="lightgray", linestyle="--", alpha=0.3)
-        plt.legend()
+            ax.plot(run_df["step"], run_df["loss"], label=run)
+        # even-spaced horizontal guides (default 0.1)
+        tick_step = 0.1
+        ax.yaxis.set_major_locator(mticker.MultipleLocator(tick_step))
+        ax.grid(which="major", axis="y", linestyle="--", alpha=0.3)
+        ax.set_xlabel("step")
+        ax.set_ylabel(f"{phase} loss")
+        ax.set_title(f"{phase} loss vs step")
+        ax.legend()
         out_path = out_dir / f"{phase}_loss_compare.png"
-        plt.tight_layout()
-        plt.savefig(out_path, dpi=120, bbox_inches="tight")
-        plt.close()
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=120, bbox_inches="tight")
+        plt.close(fig)
         print(f"Saved {out_path}")
 
 
