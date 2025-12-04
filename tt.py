@@ -13,7 +13,6 @@ from dataclasses import dataclass
 from collections import defaultdict
 from itertools import accumulate
 from pathlib import Path
-import json
 
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import torch
@@ -373,14 +372,6 @@ polar_express_coeffs = [
     (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
 ]
-# polar_express_coeffs = [
-#     (7.706030141118669, -22.229473232552213, 16.16727804459456),
-#     (3.443374785630018, -2.7282730941305497, 0.5583110302049723),
-#     (3.115515746565568, -2.8693827288726377, 0.75144940447043),
-#     (2.295274606908728, -1.9765443440388453, 0.6464378616178528),
-#     (1.8620648518207559, -1.21977185958322, 0.3580080821791749),
-# ]
-
 
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
 def polar_express(G: torch.Tensor):
@@ -599,21 +590,7 @@ class NorMuon(torch.optim.Optimizer):
             if num_params == 0:
                 v_chunk = updated_grads
             else:
-                # v_chunk = polar_express(updated_grads)
-                # [MODIFIED] Leaky Orthogonalization
-                # 1. Calculate the standard orthogonal update
-                v_ortho = polar_express(updated_grads)
-                
-                # 2. Calculate a raw normalized update (RMS norm)
-                # This preserves the internal structure of the gradient better than Polar Express
-                v_raw_norm = updated_grads.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
-                v_raw = updated_grads / v_raw_norm
-                
-                # 3. Blend them. 
-                # alpha=1.0 is standard Muon. alpha=0.5 allows spectral info to leak through.
-                # During the plateau, a lower alpha helps finding the specific direction for sparse features.
-                alpha = 0.8 
-                v_chunk = torch.lerp(v_raw, v_ortho, alpha)
+                v_chunk = polar_express(updated_grads)
 
             # NorMuon: second_momentum_buffer tracks squared magnitude of gradients along one dim (https://arxiv.org/pdf/2510.05491)
             v_norm = v_chunk.norm(dim=(-2, -1), keepdim=True)
@@ -1251,7 +1228,6 @@ class Hyperparameters:
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     train_batch_size: int = 2048 * 16 * 8
-    # train_batch_size: int = 2048 * 16 * 8*2
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
@@ -1261,8 +1237,7 @@ class Hyperparameters:
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
-    # val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
-    val_loss_every: int = 100  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
@@ -1294,7 +1269,6 @@ if master_process:
     run_id = args.run_id
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
-    loss_logfile = f"logs/{run_id}_loss.jsonl"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -1302,14 +1276,6 @@ def print0(s, console=False):
             if console:
                 print(s)
             print(s, file=f)
-
-def log_loss_record(step: int, phase: str, loss_mean: float):
-    if not master_process:
-        return
-    record = {"step": int(step), "phase": phase, "loss": float(loss_mean)}
-    line = json.dumps(record, separators=(",", ":"))
-    with open(loss_logfile, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -1352,71 +1318,15 @@ gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 optimizer1 = DistAdam(
     scalar_params + head_params + embed_params,
     lr=0.008,
-    # lr=0.016,
     betas=(0.65, 0.95),
     eps=1e-8,
     weight_decay=0.0,
 )
 optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
-# optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.10, momentum=0.95, beta2=0.95, weight_decay=1.2)
-# optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.1, momentum=0.95, beta2=0.95, weight_decay=1.2)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
-    if not hasattr(opt, "should_sync"):
-        opt.should_sync = False
-
-# optional optimizer reset/swap mid-training
-def _parse_reset_steps(val: str):
-    steps = []
-    for tok in val.split(","):
-        tok = tok.strip()
-        if not tok:
-            continue
-        try:
-            steps.append(int(tok))
-        except ValueError:
-            continue
-    return sorted(set(steps))
-
-OPT_RESET_STEPS = _parse_reset_steps(os.environ.get("OPT_RESET_STEPS", os.environ.get("OPT_RESET_STEP", "-1")))
-OPT_RESET_MODE = os.environ.get("OPT_RESET_MODE", "reset")  # "reset" or "adam"
-MOMENTUM_RESET_STEPS = _parse_reset_steps(os.environ.get("MOMENTUM_RESET_STEPS", "-1"))
-
-def make_optimizers(mode: str = "reset"):
-    # opt2 always starts as NorMuon; only when mode=="adam" do we swap to AdamW at reset step
-    opt1 = DistAdam(
-        scalar_params + head_params + embed_params,
-        lr=0.008,
-        betas=(0.65, 0.95),
-        eps=1e-8,
-        weight_decay=0.0,
-    )
-    if mode == "adam":
-        opt2 = torch.optim.AdamW(hidden_matrix_params + gate_params, lr=0.03, betas=(0.9, 0.95), weight_decay=1.2)
-    else:
-        opt2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
-    new_opts = [opt1, opt2]
-    for opt in new_opts:
-        for group in opt.param_groups:
-            group["initial_lr"] = group["lr"]
-        if not hasattr(opt, "should_sync"):
-            opt.should_sync = False
-    return new_opts
-
-
-def zero_optimizer_momentum(opt):
-    # For DistAdam: exp_avg / exp_avg_sq; for NorMuon: group buffers; generic tensors zeroed.
-    for state in opt.state.values():
-        for k, v in state.items():
-            if torch.is_tensor(v):
-                v.zero_()
-    for group in opt.param_groups:
-        for key in ("momentum_buffer", "second_momentum_buffer"):
-            buf = group.get(key, None)
-            if torch.is_tensor(buf):
-                buf.zero_()
 
 # learning rate schedule: flat, then linear decay, then flat
 def get_lr(step: int):
@@ -1426,7 +1336,6 @@ def get_lr(step: int):
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
         lr = w * 1.0 + (1 - w) * 0.1
-
     return lr
 
 def get_ws(step: int):
@@ -1467,7 +1376,6 @@ def step_optimizers(step: int, optimizers, model):
     # on even steps, only step Muon params
     # on odd steps, step all params
     if step%2==0:
-    # if step%8==0:
         optimizers[1].step()
         optimizers[1].zero_grad(set_to_none=True)
     else:
@@ -1475,8 +1383,7 @@ def step_optimizers(step: int, optimizers, model):
             optimizer.step()
         model.zero_grad(set_to_none=True)
         # disable sync in the next training step for the adam optimizer
-        if hasattr(optimizers[0], "should_sync"):
-            optimizers[0].should_sync = False
+        optimizers[0].should_sync = False
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
@@ -1527,20 +1434,6 @@ train_steps = args.num_iterations
 ws_short, ws_long = get_ws(0)
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
-    if OPT_RESET_STEPS and step in OPT_RESET_STEPS:
-        mode = "adam" if OPT_RESET_MODE.lower() == "adam" else "reset"
-        # free old optimizer state before swapping to avoid OOM spikes
-        old_opts = optimizers
-        optimizers = None
-        torch.cuda.empty_cache()
-        del old_opts
-        torch.cuda.empty_cache()
-        optimizers = make_optimizers(mode)
-        print0(f"Resetting optimizers at step {step} with mode={mode}", console=True)
-    if MOMENTUM_RESET_STEPS and step in MOMENTUM_RESET_STEPS:
-        for opt in optimizers:
-            zero_optimizer_momentum(opt)
-        print0(f"Zeroed optimizer momentum at step {step}", console=True)
     ws_short, new_ws_long = get_ws(step)
     if new_ws_long != ws_long:
         model.yarn.apply(ws_long, new_ws_long)
@@ -1566,7 +1459,6 @@ for step in range(train_steps + 1):
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-        log_loss_record(step, "val", val_loss.item() if hasattr(val_loss, "item") else float(val_loss))
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1581,24 +1473,18 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    loss_accum = 0.0
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizer on the last iteration before we step it
         if idx == grad_accum_steps - 1 and step % 2 == 1:
             optimizers[0].should_sync = True
 
         inputs, targets, cum_seqlens = next(train_loader)
-        loss_mb = model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps
-        loss_accum += loss_mb.detach().item()
-        loss_mb.backward()
+        (model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps).backward()
     step_optimizers(step, optimizers, model)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
-    # per-token mean loss (approx): accumulated scaled loss * grad_accum_steps / global tokens
-    train_loss_mean = loss_accum * grad_accum_steps / args.train_batch_size
-    log_loss_record(step + 1, "train", train_loss_mean)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
