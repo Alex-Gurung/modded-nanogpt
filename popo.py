@@ -1413,6 +1413,11 @@ def get_lr(step: int):
         w = (1 - x) / args.cooldown_frac
         lr = w * 1.0 + (1 - w) * 0.1
 
+    if step > 600:
+        lr *= 2.0
+    if step > 1600:
+        lr *= 2.0
+
     return lr
 
 def get_ws(step: int):
