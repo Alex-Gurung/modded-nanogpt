@@ -1353,27 +1353,33 @@ for opt in optimizers:
         opt.should_sync = False
 
 # optional optimizer reset/swap mid-training
-OPT_RESET_STEP = int(os.environ.get("OPT_RESET_STEP", "-1"))
+def _parse_reset_steps(val: str):
+    steps = []
+    for tok in val.split(","):
+        tok = tok.strip()
+        if not tok:
+            continue
+        try:
+            steps.append(int(tok))
+        except ValueError:
+            continue
+    return sorted(set(steps))
+
+OPT_RESET_STEPS = _parse_reset_steps(os.environ.get("OPT_RESET_STEPS", os.environ.get("OPT_RESET_STEP", "-1")))
 OPT_RESET_MODE = os.environ.get("OPT_RESET_MODE", "reset")  # "reset" or "adam"
 
 def make_optimizers(mode: str = "reset"):
+    # opt2 always starts as NorMuon; only when mode=="adam" do we swap to AdamW at reset step
+    opt1 = DistAdam(
+        scalar_params + head_params + embed_params,
+        lr=0.008,
+        betas=(0.65, 0.95),
+        eps=1e-8,
+        weight_decay=0.0,
+    )
     if mode == "adam":
-        opt1 = DistAdam(
-            scalar_params + head_params + embed_params,
-            lr=0.008,
-            betas=(0.65, 0.95),
-            eps=1e-8,
-            weight_decay=0.0,
-        )
         opt2 = torch.optim.AdamW(hidden_matrix_params + gate_params, lr=0.03, betas=(0.9, 0.95), weight_decay=1.2)
     else:
-        opt1 = DistAdam(
-            scalar_params + head_params + embed_params,
-            lr=0.008,
-            betas=(0.65, 0.95),
-            eps=1e-8,
-            weight_decay=0.0,
-        )
         opt2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
     new_opts = [opt1, opt2]
     for opt in new_opts:
@@ -1490,7 +1496,7 @@ train_steps = args.num_iterations
 ws_short, ws_long = get_ws(0)
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
-    if OPT_RESET_STEP >= 0 and step == OPT_RESET_STEP:
+    if OPT_RESET_STEPS and step in OPT_RESET_STEPS:
         mode = "adam" if OPT_RESET_MODE.lower() == "adam" else "reset"
         optimizers = make_optimizers(mode)
         print0(f"Resetting optimizers at step {step} with mode={mode}", console=True)
