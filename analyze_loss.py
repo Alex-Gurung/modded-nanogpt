@@ -41,9 +41,25 @@ def plot_runs(df: pd.DataFrame, out_dir: Path):
         plt.figure(figsize=(8, 5))
         for run, run_df in sub.groupby("run"):
             plt.plot(run_df["step"], run_df["loss"], label=run)
+        # reference lines: overall min/max and median per phase
+        y_vals = sub["loss"].to_numpy()
+        if y_vals.size > 0:
+            y_med = float(pd.Series(y_vals).median())
+            y_min = float(y_vals.min())
+            y_max = float(y_vals.max())
+            plt.axhline(y_med, color="gray", linestyle="--", alpha=0.6, label="median")
+            plt.axhline(y_min, color="gray", linestyle=":", alpha=0.4, label="min/max")
+            plt.axhline(y_max, color="gray", linestyle=":", alpha=0.4)
         plt.xlabel("step")
         plt.ylabel(f"{phase} loss")
         plt.title(f"{phase} loss vs step")
+        # optional vertical guides at key steps (quartiles of logged steps)
+        steps = sub["step"].to_numpy()
+        if steps.size > 3:
+            qs = [0.25, 0.5, 0.75]
+            for q in qs:
+                s_q = float(pd.Series(steps).quantile(q))
+                plt.axvline(s_q, color="lightgray", linestyle="--", alpha=0.3)
         plt.legend()
         out_path = out_dir / f"{phase}_loss_compare.png"
         plt.tight_layout()
