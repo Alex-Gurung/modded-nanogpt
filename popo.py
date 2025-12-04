@@ -600,20 +600,6 @@ class NorMuon(torch.optim.Optimizer):
                 v_chunk = updated_grads
             else:
                 v_chunk = polar_express(updated_grads)
-                # [MODIFIED] Leaky Orthogonalization
-                # 1. Calculate the standard orthogonal update
-                # v_ortho = polar_express(updated_grads)
-                
-                # # 2. Calculate a raw normalized update (RMS norm)
-                # # This preserves the internal structure of the gradient better than Polar Express
-                # v_raw_norm = updated_grads.norm(dim=(-2, -1), keepdim=True).clamp_min(1e-10)
-                # v_raw = updated_grads / v_raw_norm
-                
-                # # 3. Blend them. 
-                # # alpha=1.0 is standard Muon. alpha=0.5 allows spectral info to leak through.
-                # # During the plateau, a lower alpha helps finding the specific direction for sparse features.
-                # alpha = 0.5
-                # v_chunk = torch.lerp(v_raw.to(v_ortho.dtype), v_ortho, alpha)
 
             # NorMuon: second_momentum_buffer tracks squared magnitude of gradients along one dim (https://arxiv.org/pdf/2510.05491)
             v_norm = v_chunk.norm(dim=(-2, -1), keepdim=True)
@@ -913,10 +899,6 @@ class MLP(nn.Module):
         # label modules to enable custom optimizer sizing
         self.c_fc.label = 'mlp'
         self.c_proj.label = 'mlp'
-
-        # [NEW] Add bias to allow neurons to "shut up" effectively
-        self.c_fc_bias = nn.Parameter(torch.empty(hdim)) 
-        self.c_fc_bias.label = 'mlp' # Ensure it gets picked up by optimizer
         # corrective factor to account for transpose
         self.c_fc.lr_mul = 2.
 
@@ -926,16 +908,9 @@ class MLP(nn.Module):
             self.c_fc.uniform_(-bound, bound)
             self.c_proj.zero_() # zero init suggested by @Grad62304977
 
-        with torch.no_grad():
-             # ... existing weights init ...
-             # [NEW] Initialize bias to slight negative to encourage sparsity/superposition
-             self.c_fc_bias.uniform_(-0.1, 0.0)
-
     def forward(self, x: Tensor):
-        # x = F.linear(x, self.c_fc.T.type_as(x))
-        x = F.linear(x, self.c_fc.T.type_as(x), self.c_fc_bias.type_as(x))
-        # x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = F.relu(x-0.1).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+        x = F.linear(x, self.c_fc.T.type_as(x))
+        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = F.linear(x, self.c_proj.type_as(x))
         return x
 
@@ -1361,14 +1336,16 @@ gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = DistAdam(
-    scalar_params + head_params + embed_params,
+    # scalar_params + head_params + embed_params,
+    scalar_params + head_params + embed_params + gate_params,
     lr=0.008,
     # lr=0.016,
     betas=(0.65, 0.95),
     eps=1e-8,
     weight_decay=0.0,
 )
-optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
+# optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
+optimizer2 = NorMuon(hidden_matrix_params, lr=0.05, momentum=0.95, beta2=0.95, weight_decay=1.2)
 # optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.10, momentum=0.95, beta2=0.95, weight_decay=1.2)
 # optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.1, momentum=0.95, beta2=0.95, weight_decay=1.2)
 optimizers = [optimizer1, optimizer2]
