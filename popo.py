@@ -1236,7 +1236,8 @@ class Hyperparameters:
     train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_batch_size: int = 2048 * 16 * 8
+    # train_batch_size: int = 2048 * 16 * 8
+    train_batch_size: int = 2048 * 16 * 8*2
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
@@ -1246,8 +1247,8 @@ class Hyperparameters:
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
-    val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
-    # val_loss_every: int = 100  # every how many steps to evaluate val loss? 0 for only at the end
+    # val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every: int = 100  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
@@ -1336,7 +1337,8 @@ gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = DistAdam(
     scalar_params + head_params + embed_params,
-    lr=0.008,
+    # lr=0.008,
+    lr=0.016,
     betas=(0.65, 0.95),
     eps=1e-8,
     weight_decay=0.0,
