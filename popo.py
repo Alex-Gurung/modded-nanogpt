@@ -1236,8 +1236,8 @@ class Hyperparameters:
     train_files: str = "data/fineweb10B/fineweb_train_*.bin" # input .bin to train on
     val_files: str = "data/fineweb10B/fineweb_val_*.bin" # input .bin to eval validation loss on
     val_tokens: int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    # train_batch_size: int = 2048 * 16 * 8
-    train_batch_size: int = 2048 * 16 * 8*2
+    train_batch_size: int = 2048 * 16 * 8
+    # train_batch_size: int = 2048 * 16 * 8*2
     train_max_seq_len: int = 128 * 16
     val_batch_size: int = 4 * 64 * 1024 * 8
     # optimization
@@ -1337,18 +1337,51 @@ gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
 optimizer1 = DistAdam(
     scalar_params + head_params + embed_params,
-    # lr=0.008,
-    lr=0.016,
+    lr=0.008,
+    # lr=0.016,
     betas=(0.65, 0.95),
     eps=1e-8,
     weight_decay=0.0,
 )
-# optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
-optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.1, momentum=0.95, beta2=0.95, weight_decay=1.2)
+optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
+# optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.1, momentum=0.95, beta2=0.95, weight_decay=1.2)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
+    if not hasattr(opt, "should_sync"):
+        opt.should_sync = False
+
+# optional optimizer reset/swap mid-training
+OPT_RESET_STEP = int(os.environ.get("OPT_RESET_STEP", "-1"))
+OPT_RESET_MODE = os.environ.get("OPT_RESET_MODE", "reset")  # "reset" or "adam"
+
+def make_optimizers(mode: str = "reset"):
+    if mode == "adam":
+        opt1 = DistAdam(
+            scalar_params + head_params + embed_params,
+            lr=0.008,
+            betas=(0.65, 0.95),
+            eps=1e-8,
+            weight_decay=0.0,
+        )
+        opt2 = torch.optim.AdamW(hidden_matrix_params + gate_params, lr=0.03, betas=(0.9, 0.95), weight_decay=1.2)
+    else:
+        opt1 = DistAdam(
+            scalar_params + head_params + embed_params,
+            lr=0.008,
+            betas=(0.65, 0.95),
+            eps=1e-8,
+            weight_decay=0.0,
+        )
+        opt2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
+    new_opts = [opt1, opt2]
+    for opt in new_opts:
+        for group in opt.param_groups:
+            group["initial_lr"] = group["lr"]
+        if not hasattr(opt, "should_sync"):
+            opt.should_sync = False
+    return new_opts
 
 # learning rate schedule: flat, then linear decay, then flat
 def get_lr(step: int):
@@ -1405,7 +1438,8 @@ def step_optimizers(step: int, optimizers, model):
             optimizer.step()
         model.zero_grad(set_to_none=True)
         # disable sync in the next training step for the adam optimizer
-        optimizers[0].should_sync = False
+        if hasattr(optimizers[0], "should_sync"):
+            optimizers[0].should_sync = False
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
@@ -1456,6 +1490,10 @@ train_steps = args.num_iterations
 ws_short, ws_long = get_ws(0)
 for step in range(train_steps + 1):
     last_step = (step == train_steps)
+    if OPT_RESET_STEP >= 0 and step == OPT_RESET_STEP:
+        mode = "adam" if OPT_RESET_MODE.lower() == "adam" else "reset"
+        optimizers = make_optimizers(mode)
+        print0(f"Resetting optimizers at step {step} with mode={mode}", console=True)
     ws_short, new_ws_long = get_ws(step)
     if new_ws_long != ws_long:
         model.yarn.apply(ws_long, new_ws_long)
