@@ -366,13 +366,21 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     return out
 
 # Computed for num_iters=5, safety_factor=2e-2, cushion=2
+# polar_express_coeffs = [
+#     (8.156554524902461, -22.48329292557795, 15.878769915207462),
+#     (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+#     (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+#     (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+#     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+# ]
 polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+    (7.706030141118669, -22.229473232552213, 16.16727804459456),
+    (3.443374785630018, -2.7282730941305497, 0.5583110302049723),
+    (3.115515746565568, -2.8693827288726377, 0.75144940447043),
+    (2.295274606908728, -1.9765443440388453, 0.6464378616178528),
+    (1.8620648518207559, -1.21977185958322, 0.3580080821791749),
 ]
+
 
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
 def polar_express(G: torch.Tensor):
@@ -1239,6 +1247,7 @@ class Hyperparameters:
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
+    # val_loss_every: int = 100  # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint: bool = False
     # attention masking
     block_size: int = 128
