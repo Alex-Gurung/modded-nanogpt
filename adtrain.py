@@ -409,16 +409,60 @@ def polar_express(G: torch.Tensor):
 # Muon optimizer
 
 class NorMuon(torch.optim.Optimizer):
+    """
+    Muon - MomentUm Orthogonalized by Newton-schulz
+
+    https://kellerjordan.github.io/posts/muon/
+
+    Muon internally runs standard SGD-momentum, and then performs an orthogonalization post-
+    processing step, in which each 2D parameter's update is replaced with the nearest orthogonal
+    matrix. To efficiently orthogonalize each update, we use a Newton-Schulz iteration, which has
+    the advantage that it can be stably run in bfloat16 on the GPU.
+
+    Warning: This optimizer should not be used for the embedding layer, the final fully connected layer,
+    or any {0,1}-D parameters; those should all be optimized by a standard method (e.g., AdamW).
+
+    Differences from standard Muon:
+    - Newton-Shulz is replaced with Polar Express for the orthogonalization step
+    - NorMuon adds a low-rank variance estimator similar to Adafactor.
+    - small 1D parameters handled here instead of in Adam
+    - Cautious weight decay, a gated version of decoupled weight decay
+    - Custom distributed sizing:
+    The model stores all attn and mlp weights in the same shape, and then updates the view as
+    needed on the forward pass. This enables attn and mlp weights to be contained within the same
+    dist.reduce_scatter_tensor() call. The model architecture has been customized to enable
+    (n_attn_layers+n_mlp_layers*2)%8==0 for batching across 8 GPUs with zero padding on mlp and attn.
+    The scheduling is:
+        1. reduce scatter smear_gate (1 param 7 padding params)
+        2. reduce scatter attn_gate (10 params 6 padding params)
+        3. reduce scatter attn/mlp round 1 (10 attn params 6 mlp params)
+        4. reduce scatter attn/mlp round 2 (16 mlp params)
+        5. wait on step 1, then compute update of 1 and schedule all gather
+        6. wait on step 2, then compute update of 2 and schedule all gather
+        7. wait on step 3, then compute update of 3 and schedule all gather
+            GPUs receive [2 ATTN, 2 ATTN, 2 ATTN, 2 ATTN, 2 ATTN, 2 MLP, 2 MLP, 2 MLP]
+            GPUs that receive params of type attn reshape before computing update
+        8. wait on 4, then compute update of 4 and schedule all gather
+        9. wait for each all gather to complete and update params
+    Empirically, leading with small params provides an additional 0.2s improvement.
+    """
     def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, beta2=0.95, 
                  beta3=0.9995, alpha_mix=4.0, custom_sizing=True):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2, 
                         beta3=beta3, alpha_mix=alpha_mix)
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        # custom sizing requires 8 GPUs
         if custom_sizing and dist.get_world_size()==8:
             param_groups = self.generate_custom_param_groups(params)
         else:
             param_groups = self.generate_standard_param_groups(params)
         super().__init__(param_groups, defaults)
+
+    def reset(self):
+        # expose a reset for clearing buffers
+        for group in self.param_groups:
+            group["momentum_buffer"].zero_()
+            group["second_momentum_buffer"].zero_()
 
     def generate_standard_param_groups(self, params):
         """
@@ -459,6 +503,10 @@ class NorMuon(torch.optim.Optimizer):
 
     @torch.no_grad()
     def step(self, use_ademamix=False):
+        """
+        Step function for NorMuon optimizer.
+        use_ademamix: If True, use AdEMAMix instead of standard momentum.
+        """
         rank = dist.get_rank()
         group_infos = []
         # 1. Reduce Scatter (Collect grads from all GPUs)
@@ -529,7 +577,7 @@ class NorMuon(torch.optim.Optimizer):
 
             if "param_lr" not in group:
                  group["param_lr"] = (max(1., param_shape[-2] / param_shape[-1]) ** 0.5 * ref_param.new_tensor([getattr(param, "lr_mul", 1.0) for param in params[module_idx:module_idx + num_params]]).view(-1, 1, 1))
-                 group["param_wd"] = ref_param.new_tensor([getattr(param, "wd_mul", 1.0) for param in params[module_idx:module_idx + num_params]]).view(-1, 1, 1)
+                 group["param_wd"] = ref_param.new_tensor([getattr(param, "wd_mul", 1.0) for param in params[module_idx:module_idx + num_params]]).view(-1, 1, 1))
 
             eff_lr = group["lr"] * group["param_lr"]
             eff_wd = group["lr"] * group["weight_decay"] * group["param_wd"]
@@ -569,6 +617,16 @@ class NorMuon(torch.optim.Optimizer):
             info["gather_future"].wait()
             stacked_params = info["stacked_params"]
             orig_params = info["orig_params"]
+            unstacked_params = torch.unbind(stacked_params)
+            for i, p in enumerate(orig_params):
+                p.copy_(unstacked_params[i], non_blocking=True)
+
+        # Final pass: wait for all_gather to complete and copy results back into original parameter tensors.
+        for info in all_gather_infos:
+            info["gather_future"].wait()
+            stacked_params = info["stacked_params"]
+            orig_params = info["orig_params"]
+
             unstacked_params = torch.unbind(stacked_params)
             for i, p in enumerate(orig_params):
                 p.copy_(unstacked_params[i], non_blocking=True)
