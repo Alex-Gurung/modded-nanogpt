@@ -1717,20 +1717,27 @@ def create_optimizers(optimizer_name):
         opt2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
         return [opt1, opt2]
     elif optimizer_name == "ademamix":
-        # AdEMAMix for all parameters
-        opt = DistAdEMAMix(
-            list(model.parameters()),
+        # Keep DistAdam for scalars/embeddings, use AdEMAMix only for matrix params
+        opt1 = DistAdam(
+            scalar_params + head_params + embed_params,
             lr=0.008,
-            betas=(0.65, 0.95, args.ademamix_beta3),
-            alpha=args.ademamix_alpha,
+            betas=(0.65, 0.95),
             eps=1e-8,
             weight_decay=0.0,
+        )
+        opt2 = DistAdEMAMix(
+            hidden_matrix_params + gate_params,
+            lr=0.03,
+            betas=(0.95, 0.95, args.ademamix_beta3),
+            alpha=args.ademamix_alpha,
+            eps=1e-8,
+            weight_decay=1.2,
             alpha_warmup_steps=args.ademamix_alpha_warmup_steps,
             beta3_warmup_steps=args.ademamix_beta3_warmup_steps,
         )
         if args.use_schedule_free:
-            opt = ScheduleFreeWrapper(opt, beta=args.schedule_free_beta)
-        return [opt]
+            opt2 = ScheduleFreeWrapper(opt2, beta=args.schedule_free_beta)
+        return [opt1, opt2]
     else:
         raise ValueError(f"Unknown optimizer: {optimizer_name}")
 
@@ -1861,31 +1868,36 @@ for step in range(train_steps + 1):
 
     # --------------- OPTIMIZER SWITCHING -----------------
     if args.switch_optimizer_at_step == step:
-        print0(f"Switching optimizer from {args.scalar_optimizer} to {args.switch_to_optimizer} at step {step}", console=True)
+        print0(f"Switching matrix optimizer from Muon to AdEMAMix at step {step}", console=True)
 
-        # Complete reset: synchronize, clear state, rebuild from scratch
+        # Only replace optimizer2 (matrix params), keep optimizer1 (DistAdam) unchanged
         torch.cuda.synchronize()
-        dist.barrier()  # Ensure all ranks are synchronized
+        dist.barrier()
 
-        # Clear all gradients
+        # Clear gradients
         model.zero_grad(set_to_none=True)
 
-        # Delete old optimizers completely (this removes hooks and all state)
-        del optimizers
-        torch.cuda.empty_cache()
+        # Create new AdEMAMix optimizer for matrix params
+        new_opt2 = DistAdEMAMix(
+            hidden_matrix_params + gate_params,
+            lr=0.03,
+            betas=(0.95, 0.95, args.ademamix_beta3),
+            alpha=args.ademamix_alpha,
+            eps=1e-8,
+            weight_decay=1.2,
+            alpha_warmup_steps=args.ademamix_alpha_warmup_steps,
+            beta3_warmup_steps=args.ademamix_beta3_warmup_steps,
+        )
+        if args.use_schedule_free:
+            new_opt2 = ScheduleFreeWrapper(new_opt2, beta=args.schedule_free_beta)
 
-        # Wait for all ranks to finish cleanup
+        new_opt2.param_groups[0]["initial_lr"] = 0.03
+
+        # Replace only optimizer2, keep optimizer1
+        optimizers[1] = new_opt2
+
         dist.barrier()
-
-        # Create fresh optimizers with new hooks
-        optimizers = create_optimizers(args.switch_to_optimizer)
-        for opt in optimizers:
-            for group in opt.param_groups:
-                group["initial_lr"] = group["lr"]
-
-        # Synchronize again before continuing
-        dist.barrier()
-        print0(f"Optimizer switch complete, continuing training", console=True)
+        print0(f"Optimizer switch complete", console=True)
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
