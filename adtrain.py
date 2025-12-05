@@ -1608,12 +1608,12 @@ class Hyperparameters:
     use_schedule_free: bool = False # wrap optimizer in schedule-free wrapper
     schedule_free_beta: float = 0.9  # beta for schedule-free (if enabled)
     # ademamix parameters (only used if scalar_optimizer == "ademamix")
-    ademamix_beta3: float = 0.9999  # slow momentum decay
-    ademamix_alpha: float = 2.0  # slow EMA mixing coefficient
+    ademamix_beta3: float = 0.995  # slow momentum decay
+    ademamix_alpha: float = 5.0  # slow EMA mixing coefficient
     # ademamix_alpha_warmup_steps: int = 1000
     ademamix_alpha_warmup_steps: int = 0 
     # ademamix_beta3_warmup_steps: int = 1000
-    ademamix_beta3_warmup_steps: int = 0 
+    ademamix_beta3_warmup_steps: int = 100 
     # optimizer switching
     switch_optimizer_at_step: int = 500  # step to switch optimizer (-1 = no switching)
     switch_to_optimizer: str = "ademamix"  # optimizer to switch to
