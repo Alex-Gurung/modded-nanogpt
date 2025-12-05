@@ -489,7 +489,10 @@ class NorMuon(torch.optim.Optimizer):
 
         idx = 0
         group_sizes = [1, 10, 16, 16]
-        assert len(params_list) == sum(group_sizes)
+        if len(params_list) != sum(group_sizes):
+            # Fallback for architectures (e.g., GQA/MLA) where attn params
+            # are split across multiple tensors instead of a fused QKV.
+            return self.generate_standard_param_groups(params)
         param_groups = []
         for size in group_sizes:
             chunk_size = (size + self.world_size - 1) // self.world_size
@@ -556,13 +559,17 @@ class NorMuon(torch.optim.Optimizer):
             updated_grads = grad_chunk[:num_params].lerp_(momentum_buffer, group["momentum"])
 
             grad_shape = updated_grads.shape
-            if params[module_idx].label == 'attn':
+            param_shape = params[module_idx].shape
+            is_fused_qkv = (
+                params[module_idx].label == 'attn'
+                and param_shape[-1] == 4 * param_shape[-2]
+            )
+            if is_fused_qkv:
                 # Reshape attn params from [hdim, dim*4] to [4,hdim,dim]
                 for p in params[module_idx:module_idx + num_params]:
                     assert p.label == 'attn'
                 updated_grads = updated_grads.view(4 * grad_shape[0], grad_shape[1], grad_shape[2] // 4)
             ref_param = params[module_idx]
-            param_shape = ref_param.shape
 
             if "second_momentum_buffer" not in group:
                 group["second_momentum_buffer"] = (torch.zeros_like(updated_grads[..., :, :1])
@@ -1326,7 +1333,9 @@ class CausalSelfAttention(nn.Module):
             q, k = rotary(q, cos, sin), rotary(k, cos, sin)
 
             if ve is not None:
-                v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view(B, T, self.num_kv_heads, self.head_dim)
+                ve_kv = ve.view(B, T, self.num_heads, self.head_dim)
+                ve_kv = ve_kv.view(B, T, self.num_kv_heads, self.num_q_per_kv, self.head_dim).mean(dim=3)
+                v = sa_lambdas[0] * v + sa_lambdas[1] * ve_kv
             else:
                 v = sa_lambdas[0] * v
 
