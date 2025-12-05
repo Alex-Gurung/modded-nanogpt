@@ -1601,20 +1601,22 @@ class Hyperparameters:
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # optimizer selection
     scalar_optimizer: str = "adam"  # "adam" or "ademamix"
-    use_schedule_free: bool = False  # wrap optimizer in schedule-free wrapper
+    use_schedule_free: bool = True # wrap optimizer in schedule-free wrapper
     schedule_free_beta: float = 0.9  # beta for schedule-free (if enabled)
     # ademamix parameters (only used if scalar_optimizer == "ademamix")
     ademamix_beta3: float = 0.9999  # slow momentum decay
-    ademamix_alpha: float = 5.0  # slow EMA mixing coefficient
-    ademamix_alpha_warmup_steps: int = 1000
-    ademamix_beta3_warmup_steps: int = 1000
+    ademamix_alpha: float = 2.0  # slow EMA mixing coefficient
+    # ademamix_alpha_warmup_steps: int = 1000
+    ademamix_alpha_warmup_steps: int = 0 
+    # ademamix_beta3_warmup_steps: int = 1000
+    ademamix_beta3_warmup_steps: int = 0 
     # optimizer switching
-    switch_optimizer_at_step: int = -1  # step to switch optimizer (-1 = no switching)
+    switch_optimizer_at_step: int = 500  # step to switch optimizer (-1 = no switching)
     switch_to_optimizer: str = "ademamix"  # optimizer to switch to
     switch_transfer_momentum: bool = True  # transfer momentum when switching
     # momentum soft reset
     soft_reset_momentum_at_steps: tuple = ()  # steps to soft reset momentum (e.g., (500, 1000))
-    soft_reset_momentum_beta: float = 0.1  # temporary beta1 value for soft reset (lower = more reset)
+    soft_reset_momentum_beta: float = 0.4  # temporary beta1 value for soft reset (lower = more reset)
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
@@ -1731,10 +1733,12 @@ def create_optimizers(optimizer_name):
         opt2 = DistAdEMAMix(
             hidden_matrix_params + gate_params,
             lr=0.03,
-            betas=(0.95, 0.95, args.ademamix_beta3),
+            # betas=(0.95, 0.95, args.ademamix_beta3),
+            betas=(0.9, 0.999, args.ademamix_beta3),
             alpha=args.ademamix_alpha,
             eps=1e-8,
-            weight_decay=1.2,
+            # weight_decay=1.2,
+            weight_decay=0.0,
             alpha_warmup_steps=args.ademamix_alpha_warmup_steps,
             beta3_warmup_steps=args.ademamix_beta3_warmup_steps,
         )
@@ -1758,6 +1762,10 @@ def get_lr(step: int):
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
         lr = w * 1.0 + (1 - w) * 0.1
+
+    if x >= 500:
+        lr += 1.5*x
+
     return lr
 
 def get_ws(step: int):
