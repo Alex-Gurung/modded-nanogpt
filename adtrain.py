@@ -1609,7 +1609,7 @@ class Hyperparameters:
     ademamix_alpha_warmup_steps: int = 1000
     ademamix_beta3_warmup_steps: int = 1000
     # optimizer switching
-    switch_optimizer_at_step: int = 500  # step to switch optimizer (-1 = no switching)
+    switch_optimizer_at_step: int = -1  # step to switch optimizer (-1 = no switching)
     switch_to_optimizer: str = "ademamix"  # optimizer to switch to
     switch_transfer_momentum: bool = True  # transfer momentum when switching
     # evaluation and logging
