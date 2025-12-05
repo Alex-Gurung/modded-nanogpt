@@ -884,11 +884,6 @@ class DistAdEMAMix(torch.optim.Optimizer):
                 else:
                     beta3 = target_beta3
 
-                # weight decay
-                if wd != 0:
-                    eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
-                    p_slice.mul_(1 - eff_weight_decay)
-
                 # Update fast EMA (with bias correction like standard Adam)
                 exp_avg_fast.mul_(beta1).add_(g_slice, alpha=1 - beta1)
 
@@ -910,6 +905,13 @@ class DistAdEMAMix(torch.optim.Optimizer):
                 # compute step
                 denom = (exp_avg_sq.sqrt() / (bias2 ** 0.5)) + eps
                 update = combined_grad / denom
+
+                # Apply L2 weight decay (like reference implementation)
+                # This adds the parameters to the update BEFORE scaling by lr
+                if wd != 0:
+                    eff_weight_decay = wd * getattr(param, "wd_mul", 1.0)
+                    update = update + eff_weight_decay * p_slice
+
                 p_slice.add_(update, alpha=-lr)
 
                 all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
@@ -1765,9 +1767,6 @@ def get_lr(step: int):
         w = (1 - x) / args.cooldown_frac
         lr = w * 1.0 + (1 - w) * 0.1
 
-    if x >= 500:
-        lr += 1.5*x
-
     return lr
 
 def get_ws(step: int):
@@ -1938,7 +1937,8 @@ for step in range(train_steps + 1):
         # Create new AdEMAMix optimizer for matrix params
         new_opt2 = DistAdEMAMix(
             hidden_matrix_params + gate_params,
-            lr=0.03,
+            # lr=0.03,
+            lr=0.008,
             betas=(0.9, 0.999, args.ademamix_beta3),
             alpha=args.ademamix_alpha,
             eps=1e-8,
