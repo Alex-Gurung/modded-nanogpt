@@ -1627,17 +1627,18 @@ class Hyperparameters:
     # ademamix_beta3_warmup_steps: int = 1000
     ademamix_beta3_warmup_steps: int = 100 
     # optimizer switching
-    switch_optimizer_at_step: int = 500  # step to switch optimizer (-1 = no switching)
+    switch_optimizer_at_step: int = -1 # step to switch optimizer (-1 = no switching)
     switch_to_optimizer: str = "ademamix"  # optimizer to switch to
     switch_transfer_momentum: bool = True  # transfer momentum when switching
     # momentum soft reset
     soft_reset_momentum_at_steps: tuple = ()  # steps to soft reset momentum (e.g., (500, 1000))
     soft_reset_momentum_beta: float = 0.4  # temporary beta1 value for soft reset (lower = more reset)
     # architectural sparsity options
-    mlp_expansion_factor: float = 4.0  # MLP hidden dim = expansion_factor * model_dim (default 4.0, try 3.0 for 25% savings)
-    mlp_topk_ratio: float = 1.0  # Keep top-k ratio of MLP activations (1.0 = dense, 0.75 = 25% sparse)
+    mlp_expansion_factor: float = 3.0  # MLP hidden dim = expansion_factor * model_dim (default 4.0, try 3.0 for 25% savings)
+    mlp_topk_ratio: float = 0.75  # Keep top-k ratio of MLP activations (1.0 = dense, 0.75 = 25% sparse)
     use_adaptive_depth: bool = False  # Enable adaptive depth (early exit for easy tokens)
     adaptive_depth_threshold: float = 0.5  # Confidence threshold for early exit (higher = exit earlier)
+
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
