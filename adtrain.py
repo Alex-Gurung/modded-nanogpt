@@ -523,7 +523,10 @@ class NorMuon(torch.optim.Optimizer):
                 device=params[0].device
             )
             for i, p in enumerate(params):
-                stacked_grads[i].copy_(p.grad, non_blocking=True)
+                if p.grad is None:
+                    stacked_grads[i].zero_()
+                else:
+                    stacked_grads[i].copy_(p.grad, non_blocking=True)
             if len(params) < padded_num_params:
                 stacked_grads[len(params):].zero_()
 
@@ -1402,7 +1405,9 @@ class CausalSelfAttention(nn.Module):
 
                 # Apply causal mask
                 causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
-                indexer_scores = indexer_scores.masked_fill(causal_mask.unsqueeze(0), float('-inf'))
+                causal_mask = causal_mask.view(1, 1, T, T)  # (1,1,T,T)
+                indexer_scores = indexer_scores.unsqueeze(-2)  # (B, num_heads, 1, T)
+                indexer_scores = indexer_scores.masked_fill(causal_mask, float('-inf')).squeeze(-2)
 
                 # Select top-k tokens per query
                 k_sparse = min(self.dsa_topk, T)
