@@ -1612,6 +1612,9 @@ class Hyperparameters:
     switch_optimizer_at_step: int = 500  # step to switch optimizer (-1 = no switching)
     switch_to_optimizer: str = "ademamix"  # optimizer to switch to
     switch_transfer_momentum: bool = True  # transfer momentum when switching
+    # momentum soft reset
+    soft_reset_momentum_at_steps: tuple = ()  # steps to soft reset momentum (e.g., (500, 1000))
+    soft_reset_momentum_beta: float = 0.1  # temporary beta1 value for soft reset (lower = more reset)
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
@@ -1782,6 +1785,31 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
     return momentum
 
 def step_optimizers(step: int, optimizers, model):
+    # Soft reset momentum if requested
+    soft_reset_active = step in args.soft_reset_momentum_at_steps
+    saved_betas = {}
+
+    if soft_reset_active:
+        print0(f"Applying momentum soft reset at step {step} (beta1={args.soft_reset_momentum_beta})", console=True)
+        # Temporarily override beta1/momentum for this step
+        for i, optimizer in enumerate(optimizers):
+            base_opt = optimizer.optimizer if isinstance(optimizer, ScheduleFreeWrapper) else optimizer
+            if hasattr(base_opt, 'defaults'):
+                if 'betas' in base_opt.defaults:
+                    # DistAdam or DistAdEMAMix
+                    for group in base_opt.param_groups:
+                        saved_betas[i] = group.get('beta1', group['betas'][0])
+                        if 'beta1' in group:
+                            group['beta1'] = args.soft_reset_momentum_beta
+                        else:
+                            old_betas = group['betas']
+                            group['betas'] = (args.soft_reset_momentum_beta, old_betas[1]) if len(old_betas) == 2 else (args.soft_reset_momentum_beta, old_betas[1], old_betas[2])
+                elif 'momentum' in base_opt.defaults:
+                    # NorMuon
+                    for group in base_opt.param_groups:
+                        saved_betas[i] = group['momentum']
+                        group['momentum'] = args.soft_reset_momentum_beta
+
     # update lr
     for optimizer in optimizers:
         for group in optimizer.param_groups:
@@ -1789,10 +1817,11 @@ def step_optimizers(step: int, optimizers, model):
 
     # If using dual optimizer setup (Adam + Muon)
     if len(optimizers) == 2:
-        # set muon momentum based on step
-        momentum = get_muon_momentum(step)
-        for group in optimizers[1].param_groups:
-            group["momentum"] = momentum
+        # set muon momentum based on step (unless soft reset is active)
+        if not soft_reset_active:
+            momentum = get_muon_momentum(step)
+            for group in optimizers[1].param_groups:
+                group["momentum"] = momentum
 
         # on even steps, only step Muon params
         # on odd steps, step all params
@@ -1810,6 +1839,25 @@ def step_optimizers(step: int, optimizers, model):
         for optimizer in optimizers:
             optimizer.step()
         model.zero_grad(set_to_none=True)
+
+    # Restore original momentum values after soft reset
+    if soft_reset_active:
+        for i, optimizer in enumerate(optimizers):
+            if i not in saved_betas:
+                continue
+            base_opt = optimizer.optimizer if isinstance(optimizer, ScheduleFreeWrapper) else optimizer
+            if hasattr(base_opt, 'defaults'):
+                if 'betas' in base_opt.defaults:
+                    for group in base_opt.param_groups:
+                        if 'beta1' in group:
+                            group['beta1'] = saved_betas[i]
+                        else:
+                            old_betas = group['betas']
+                            group['betas'] = (saved_betas[i], old_betas[1]) if len(old_betas) == 2 else (saved_betas[i], old_betas[1], old_betas[2])
+                elif 'momentum' in base_opt.defaults:
+                    for group in base_opt.param_groups:
+                        group['momentum'] = saved_betas[i]
+        print0(f"Momentum restored after soft reset", console=True)
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
@@ -1891,7 +1939,9 @@ for step in range(train_steps + 1):
         if args.use_schedule_free:
             new_opt2 = ScheduleFreeWrapper(new_opt2, beta=args.schedule_free_beta)
 
-        new_opt2.param_groups[0]["initial_lr"] = 0.03
+        # Set initial_lr for all param groups
+        for group in new_opt2.param_groups:
+            group["initial_lr"] = group["lr"]
 
         # Replace only optimizer2, keep optimizer1
         optimizers[1] = new_opt2
