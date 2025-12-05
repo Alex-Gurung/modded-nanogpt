@@ -1249,9 +1249,10 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, expansion_factor: float = 4.0, topk_ratio: float = 1.0):
         super().__init__()
-        hdim = 4 * dim
+        hdim = int(expansion_factor * dim)
+        self.topk_ratio = topk_ratio
         # make matrices the same shape to enable batched call in optimizer
         self.c_fc = nn.Parameter(torch.empty(dim, hdim))
         self.c_proj = nn.Parameter(torch.empty(dim, hdim))
@@ -1270,16 +1271,27 @@ class MLP(nn.Module):
     def forward(self, x: Tensor):
         x = F.linear(x, self.c_fc.T.type_as(x))
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
+
+        # Apply top-k sparsity if requested
+        if self.topk_ratio < 1.0 and self.training:
+            k = max(1, int(self.topk_ratio * x.size(-1)))
+            # Get top-k values and indices
+            topk_vals, topk_idx = torch.topk(x, k, dim=-1)
+            # Create sparse tensor
+            x_sparse = torch.zeros_like(x)
+            x_sparse.scatter_(-1, topk_idx, topk_vals)
+            x = x_sparse
+
         x = F.linear(x, self.c_proj.type_as(x))
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, mlp_expansion_factor: float = 4.0, mlp_topk_ratio: float = 1.0):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
         self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx not in [0, 7] else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
-        self.mlp = MLP(dim) if layer_idx != 0 else None
+        self.mlp = MLP(dim, mlp_expansion_factor, mlp_topk_ratio) if layer_idx != 0 else None
 
     def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs):
         x = lambdas[0] * x + lambdas[1] * x0
@@ -1296,7 +1308,7 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int, mlp_expansion_factor: float = 4.0, mlp_topk_ratio: float = 1.0):
         super().__init__()
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
@@ -1306,7 +1318,7 @@ class GPT(nn.Module):
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i, mlp_expansion_factor, mlp_topk_ratio) for i in range(num_layers)])
         self.yarn = Yarn(head_dim, max_seq_len)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
@@ -1621,6 +1633,11 @@ class Hyperparameters:
     # momentum soft reset
     soft_reset_momentum_at_steps: tuple = ()  # steps to soft reset momentum (e.g., (500, 1000))
     soft_reset_momentum_beta: float = 0.4  # temporary beta1 value for soft reset (lower = more reset)
+    # architectural sparsity options
+    mlp_expansion_factor: float = 4.0  # MLP hidden dim = expansion_factor * model_dim (default 4.0, try 3.0 for 25% savings)
+    mlp_topk_ratio: float = 1.0  # Keep top-k ratio of MLP activations (1.0 = dense, 0.75 = 25% sparse)
+    use_adaptive_depth: bool = False  # Enable adaptive depth (early exit for easy tokens)
+    adaptive_depth_threshold: float = 0.5  # Confidence threshold for early exit (higher = exit earlier)
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
@@ -1694,7 +1711,9 @@ model: nn.Module = GPT(
     num_heads=6,
     head_dim=128,
     model_dim=768,
-    max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size)
+    max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size),
+    mlp_expansion_factor=args.mlp_expansion_factor,
+    mlp_topk_ratio=args.mlp_topk_ratio
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
