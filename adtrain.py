@@ -576,17 +576,27 @@ class NorMuon(torch.optim.Optimizer):
             second_momentum_buffer = group["second_momentum_buffer"]
 
             if "param_lr" not in group:
-                 group["param_lr"] = (max(1., param_shape[-2] / param_shape[-1]) ** 0.5 * ref_param.new_tensor([getattr(param, "lr_mul", 1.0) for param in params[module_idx:module_idx + num_params]]).view(-1, 1, 1))
-                 group["param_wd"] = ref_param.new_tensor([getattr(param, "wd_mul", 1.0) for param in params[module_idx:module_idx + num_params]]).view(-1, 1, 1))
+                group["param_lr"] = (
+                    max(1., param_shape[-2] / param_shape[-1]) ** 0.5
+                    * ref_param.new_tensor(
+                        [getattr(param, "lr_mul", 1.0) for param in params[module_idx:module_idx + num_params]]
+                    ).view(-1, 1, 1)
+                )
+
+                group["param_wd"] = ref_param.new_tensor(
+                    [getattr(param, "wd_mul", 1.0) for param in params[module_idx:module_idx + num_params]]
+                ).view(-1, 1, 1)
 
             eff_lr = group["lr"] * group["param_lr"]
             eff_wd = group["lr"] * group["weight_decay"] * group["param_wd"]
 
-            # Newton-Schulz / Polar Express
-            if num_params == 0: v_chunk = updated_grads
-            else: v_chunk = polar_express(updated_grads) # Uses the global coeffs
+            # Compute zeropower for the entire chunk in a single, batched call.
+            if num_params == 0:
+                v_chunk = updated_grads
+            else:
+                v_chunk = polar_express(updated_grads)
 
-            # Scale to spectral radius 1
+            # NorMuon: second_momentum_buffer tracks squared magnitude of gradients along one dim (https://arxiv.org/pdf/2510.05491)
             v_norm = v_chunk.norm(dim=(-2, -1), keepdim=True)
             v_mean = v_chunk.square().mean(dim=-1 if param_shape[-2] >= param_shape[-1] else -2, keepdim=True)
             second_momentum_buffer.lerp_(v_mean.to(dtype=ref_param.dtype), 1 - group["beta2"])
@@ -596,6 +606,7 @@ class NorMuon(torch.optim.Optimizer):
             v_chunk.mul_(v_norm / v_norm_new.clamp_min_(1e-10))
 
             v_chunk = v_chunk.view(grad_shape)
+
             updated_params = torch.empty_like(grad_chunk)
             param_chunk = torch.stack(params[module_idx:module_idx + num_params]) if num_params > 0 else torch.zeros_like(v_chunk)
             
