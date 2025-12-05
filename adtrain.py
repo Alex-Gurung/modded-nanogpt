@@ -469,10 +469,10 @@ class NorMuon(torch.optim.Optimizer):
         """
         groups = defaultdict(list)
         for param in params:
-            groups[param.label].append(param)
+            groups[(param.label, tuple(param.shape))].append(param)
 
         param_groups = []
-        for module_name, group_params in groups.items():
+        for (_, _), group_params in groups.items():
             chunk_size = (len(group_params) + self.world_size - 1) // self.world_size
             param_groups.append(dict(params=group_params, chunk_size=chunk_size))
 
@@ -487,18 +487,18 @@ class NorMuon(torch.optim.Optimizer):
         params_list = list(params)
         params_list.sort(key=lambda x: module_group_order.index(x.label))
 
-        idx = 0
-        group_sizes = [1, 10, 16, 16]
-        if len(params_list) != sum(group_sizes):
-            # Fallback for architectures (e.g., GQA/MLA) where attn params
-            # are split across multiple tensors instead of a fused QKV.
-            return self.generate_standard_param_groups(params)
         param_groups = []
-        for size in group_sizes:
-            chunk_size = (size + self.world_size - 1) // self.world_size
-            group_params = params_list[idx: idx + size]
-            param_groups.append(dict(params=group_params, chunk_size=chunk_size))
-            idx += size
+        for label in module_group_order:
+            label_params = [p for p in params_list if p.label == label]
+            if not label_params:
+                continue
+            # keep shape separation to avoid mixing fused/unfused attn tensors
+            shape_buckets = defaultdict(list)
+            for p in label_params:
+                shape_buckets[p.shape].append(p)
+            for _, group_params in shape_buckets.items():
+                chunk_size = (len(group_params) + self.world_size - 1) // self.world_size
+                param_groups.append(dict(params=group_params, chunk_size=chunk_size))
 
         return param_groups
 
@@ -1365,8 +1365,11 @@ class CausalSelfAttention(nn.Module):
             q_nope = F.linear(c_q, self.q_up_nope.type_as(c_q)).view(B, T, self.num_heads, self.head_dim)
 
             # Decoupled RoPE for Q
+            rope_dim = self.mla_rope_dim // 2
+            rope_cos, rope_sin = cos[..., :rope_dim], sin[..., :rope_dim]
+            assert rope_cos.size(-1) == rope_dim, "YaRN rope dims must cover MLA rope size"
             q_rope_latent = F.linear(c_q, self.q_rope.type_as(c_q)).view(B, T, self.num_heads, self.mla_rope_dim)
-            q_rope_latent = rotary(q_rope_latent, cos, sin)  # Apply RoPE in decoupled space
+            q_rope_latent = rotary(q_rope_latent, rope_cos, rope_sin)  # Apply RoPE in decoupled space
 
             # Concatenate NoPE and RoPE components for Q
             # For simplicity with flash_attn, we'll add them (in practice, concat then project)
@@ -1375,7 +1378,7 @@ class CausalSelfAttention(nn.Module):
 
             # Decoupled RoPE for K
             k_rope = F.linear(x, self.k_rope.type_as(x))  # (B, T, mla_rope_dim)
-            k_rope = rotary(k_rope.unsqueeze(2), cos, sin).squeeze(2)  # Apply RoPE
+            k_rope = rotary(k_rope.unsqueeze(2), rope_cos, rope_sin).squeeze(2)  # Apply RoPE
 
             # For flash_attn, expand compressed K (simplified - proper MLA keeps compressed)
             # In real MLA, attention is computed in compressed space
@@ -1646,7 +1649,7 @@ class BOSFinder:
             cur_len = 0
             while cur_len <= num_tokens_local:
                 if idx >= n:
-                    raise StopIteration(f"Insufficient BOS ahead of position {cur}; hit tail of shard.")
+                    raise StopIteration(f"Insufficient BOS positions at idx={idx}; hit tail of shard.")
                 cur = self.bos_idx[idx]
                 starts[r].append(cur)
                 end = min(self.bos_idx[idx + 1] if idx + 1 < n else self.size,
@@ -1752,7 +1755,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         if new_params is not None:
             # makes it possible for generator to receive new (num_tokens, max_seq_len, grad_accum_steps) via .send()
             new_num_tokens, new_max_seq_len, new_grad_accum_steps = new_params
-            assert new_num_tokens % (world_size * grad_accum_steps) == 0, "Num tokens must be divisible by world size"
+            assert new_num_tokens % (world_size * new_grad_accum_steps) == 0, "Num tokens must be divisible by world size"
             num_tokens = new_num_tokens
             max_seq_len = new_max_seq_len
             grad_accum_steps = new_grad_accum_steps
@@ -1794,8 +1797,8 @@ class Hyperparameters:
     soft_reset_momentum_at_steps: tuple = ()  # steps to soft reset momentum (e.g., (500, 1000))
     soft_reset_momentum_beta: float = 0.4  # temporary beta1 value for soft reset (lower = more reset)
     # architectural sparsity options
-    mlp_expansion_factor: float = 3.0  # MLP hidden dim = expansion_factor * model_dim (default 4.0, try 3.0 for 25% savings)
-    mlp_topk_ratio: float = 0.75  # Keep top-k ratio of MLP activations (1.0 = dense, 0.75 = 25% sparse)
+    mlp_expansion_factor: float = 4.0  # MLP hidden dim = expansion_factor * model_dim (default 4.0, try 3.0 for 25% savings)
+    mlp_topk_ratio: float = 1.0  # Keep top-k ratio of MLP activations (1.0 = dense, 0.75 = 25% sparse)
     use_adaptive_depth: bool = False  # Enable adaptive depth (early exit for easy tokens)
     adaptive_depth_threshold: float = 0.5  # Confidence threshold for early exit (higher = exit earlier)
     # attention architecture options
