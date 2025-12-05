@@ -1601,7 +1601,7 @@ class Hyperparameters:
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # optimizer selection
     scalar_optimizer: str = "adam"  # "adam" or "ademamix"
-    use_schedule_free: bool = True # wrap optimizer in schedule-free wrapper
+    use_schedule_free: bool = False # wrap optimizer in schedule-free wrapper
     schedule_free_beta: float = 0.9  # beta for schedule-free (if enabled)
     # ademamix parameters (only used if scalar_optimizer == "ademamix")
     ademamix_beta3: float = 0.9999  # slow momentum decay
