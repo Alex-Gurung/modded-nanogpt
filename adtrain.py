@@ -1862,17 +1862,30 @@ for step in range(train_steps + 1):
     # --------------- OPTIMIZER SWITCHING -----------------
     if args.switch_optimizer_at_step == step:
         print0(f"Switching optimizer from {args.scalar_optimizer} to {args.switch_to_optimizer} at step {step}", console=True)
-        # Remove old backward hooks from previous optimizers
-        for opt in optimizers:
-            if hasattr(opt, '_reduce_scatter_hooks'):
-                for hook in opt._reduce_scatter_hooks:
-                    hook.remove()
-                opt._reduce_scatter_hooks.clear()
-        # Create new optimizers
+
+        # Complete reset: synchronize, clear state, rebuild from scratch
+        torch.cuda.synchronize()
+        dist.barrier()  # Ensure all ranks are synchronized
+
+        # Clear all gradients
+        model.zero_grad(set_to_none=True)
+
+        # Delete old optimizers completely (this removes hooks and all state)
+        del optimizers
+        torch.cuda.empty_cache()
+
+        # Wait for all ranks to finish cleanup
+        dist.barrier()
+
+        # Create fresh optimizers with new hooks
         optimizers = create_optimizers(args.switch_to_optimizer)
         for opt in optimizers:
             for group in opt.param_groups:
                 group["initial_lr"] = group["lr"]
+
+        # Synchronize again before continuing
+        dist.barrier()
+        print0(f"Optimizer switch complete, continuing training", console=True)
 
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
