@@ -446,10 +446,8 @@ class NorMuon(torch.optim.Optimizer):
         9. wait for each all gather to complete and update params
     Empirically, leading with small params provides an additional 0.2s improvement.
     """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, beta2=0.95, 
-                 beta3=0.9995, alpha_mix=4.0, custom_sizing=True):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2, 
-                        beta3=beta3, alpha_mix=alpha_mix)
+    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, beta2=0.95, custom_sizing=True):
+        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2)
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         # custom sizing requires 8 GPUs
         if custom_sizing and dist.get_world_size()==8:
@@ -502,77 +500,74 @@ class NorMuon(torch.optim.Optimizer):
         return param_groups
 
     @torch.no_grad()
-    def step(self, use_ademamix=False):
-        """
-        Step function for NorMuon optimizer.
-        use_ademamix: If True, use AdEMAMix instead of standard momentum.
-        """
+    def step(self):
+        # Efficient systems-wise implementation of step developed by @YouJiacheng,
+        # @KonstantinWilleke, @alexrgilbert, @adricarda, @tuttyfrutyee, @vdlad,
+        # @ryanyang0, @vagrawal, and @varunneal.
         rank = dist.get_rank()
         group_infos = []
-        # 1. Reduce Scatter (Collect grads from all GPUs)
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
-            if not params: continue
+            if not params:
+                continue
+
             chunk_size = group["chunk_size"]
             padded_num_params = chunk_size * self.world_size
-            stacked_grads = torch.empty((padded_num_params, *params[0].shape), dtype=params[0].dtype, device=params[0].device)
+
+            stacked_grads = torch.empty(
+                (padded_num_params, *params[0].shape),
+                dtype=params[0].dtype,
+                device=params[0].device
+            )
             for i, p in enumerate(params):
                 stacked_grads[i].copy_(p.grad, non_blocking=True)
             if len(params) < padded_num_params:
                 stacked_grads[len(params):].zero_()
+
             grad_chunk = torch.empty_like(stacked_grads[:chunk_size])
-            reduce_future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
+
+            reduce_future = dist.reduce_scatter_tensor(
+                grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True
+            ).get_future()
+
             group_infos.append(dict(grad_chunk=grad_chunk, reduce_future=reduce_future))
 
         all_gather_infos = []
-        # 2. Update Local Shard
+        # Second pass: wait for gradients, compute updates for the local shard of parameters,
+        # and launch all async all_gather operations.
         for group, info in zip(self.param_groups, group_infos):
             info["reduce_future"].wait()
+
             params = group["params"]
             grad_chunk = info["grad_chunk"]
             chunk_size = group["chunk_size"]
-            
+            padded_num_params = chunk_size * self.world_size
+
             start_idx = rank * chunk_size
             module_idx = start_idx if start_idx < len(params) else 0
-            num_params = min(chunk_size, max(0, len(params) - start_idx))
-            
-            if "momentum_buffer" not in group:
-                group["momentum_buffer"] = torch.zeros_like(grad_chunk[:num_params])
-            momentum_buffer = group["momentum_buffer"]
-            
-            # --- 1. Fast Momentum (Beta1 ~0.95) ---
-            momentum_buffer.lerp_(grad_chunk[:num_params], 1 - group["momentum"])
-            
-            if use_ademamix:
-                # --- 2. Slow Momentum (Beta3 ~0.9999) ---
-                if "slow_momentum_buffer" not in group:
-                    group["slow_momentum_buffer"] = torch.zeros_like(grad_chunk[:num_params])
-                slow_buffer = group["slow_momentum_buffer"]
-                slow_buffer.lerp_(grad_chunk[:num_params], 1 - group["beta3"])
-                
-                # --- 3. Mix: Fast + Alpha * Slow ---
-                # This "Proxy Gradient" contains the deep memory of the optimization
-                proxy_grad = momentum_buffer + group["alpha_mix"] * slow_buffer
-                updated_grads = proxy_grad
-            else:
-                updated_grads = momentum_buffer
 
-            # Reshaping Logic
+            num_params = min(chunk_size, max(0, len(params) - start_idx))  # num params for this rank
+
+            if "momentum_buffer" not in group:
+                group["momentum_buffer"]  = torch.zeros_like(grad_chunk[:num_params])
+            momentum_buffer = group["momentum_buffer"]
+            # Apply momentum update to the persistent momentum buffer in-place
+            momentum_buffer.lerp_(grad_chunk[:num_params], 1 - group["momentum"])
+            updated_grads = grad_chunk[:num_params].lerp_(momentum_buffer, group["momentum"])
+
             grad_shape = updated_grads.shape
             if params[module_idx].label == 'attn':
-                for p in params[module_idx:module_idx + num_params]: assert p.label == 'attn'
+                # Reshape attn params from [hdim, dim*4] to [4,hdim,dim]
+                for p in params[module_idx:module_idx + num_params]:
+                    assert p.label == 'attn'
                 updated_grads = updated_grads.view(4 * grad_shape[0], grad_shape[1], grad_shape[2] // 4)
-            # [Grouped MLP] Split (D, 4D) -> 4x (D, D) for better superposition
-            elif params[module_idx].label == 'mlp':
-                 for p in params[module_idx:module_idx + num_params]: assert p.label == 'mlp'
-                 updated_grads = updated_grads.view(4 * grad_shape[0], grad_shape[1], grad_shape[2] // 4)
-
             ref_param = params[module_idx]
             param_shape = ref_param.shape
 
-            # Second Momentum (RMSNorm of update)
             if "second_momentum_buffer" not in group:
-                group["second_momentum_buffer"] = (torch.zeros_like(updated_grads[..., :, :1]) if param_shape[-2] >= param_shape[-1] else torch.zeros_like(updated_grads[..., :1, :]))
+                group["second_momentum_buffer"] = (torch.zeros_like(updated_grads[..., :, :1])
+                    if param_shape[-2] >= param_shape[-1] else torch.zeros_like(updated_grads[..., :1, :])
+                )
             second_momentum_buffer = group["second_momentum_buffer"]
 
             if "param_lr" not in group:
@@ -587,6 +582,7 @@ class NorMuon(torch.optim.Optimizer):
                     [getattr(param, "wd_mul", 1.0) for param in params[module_idx:module_idx + num_params]]
                 ).view(-1, 1, 1)
 
+            # Determine LR and WR
             eff_lr = group["lr"] * group["param_lr"]
             eff_wd = group["lr"] * group["weight_decay"] * group["param_wd"]
 
@@ -609,28 +605,34 @@ class NorMuon(torch.optim.Optimizer):
 
             updated_params = torch.empty_like(grad_chunk)
             param_chunk = torch.stack(params[module_idx:module_idx + num_params]) if num_params > 0 else torch.zeros_like(v_chunk)
-            
-            # Cautious Weight Decay
+
+            # "Cautious" weight decay (https://arxiv.org/abs/2510.12402)
             mask = (v_chunk * param_chunk) >= 0
             v_chunk.addcmul_(param_chunk, (eff_wd * mask).to(ref_param.dtype))
+
             param_chunk.addcmul_(v_chunk, -eff_lr)
 
             updated_params[:num_params].copy_(param_chunk)
             if num_params < chunk_size:
                 updated_params[num_params:].zero_()
 
-            # 3. All Gather (Distribute results back)
-            stacked_params = torch.empty((padded_num_params, *param_shape), dtype=updated_params.dtype, device=updated_params.device)
-            gather_future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True).get_future()
-            all_gather_infos.append({"gather_future": gather_future, "stacked_params": stacked_params, "orig_params": params})
+            stacked_params = torch.empty(
+                (padded_num_params, *param_shape),
+                dtype=updated_params.dtype,
+                device=updated_params.device,
+            )
 
-        for info in all_gather_infos:
-            info["gather_future"].wait()
-            stacked_params = info["stacked_params"]
-            orig_params = info["orig_params"]
-            unstacked_params = torch.unbind(stacked_params)
-            for i, p in enumerate(orig_params):
-                p.copy_(unstacked_params[i], non_blocking=True)
+            gather_future = dist.all_gather_into_tensor(
+                stacked_params, updated_params, async_op=True
+            ).get_future()
+
+            all_gather_infos.append(
+                {
+                    "gather_future": gather_future,
+                    "stacked_params": stacked_params,
+                    "orig_params": params,
+                }
+            )
 
         # Final pass: wait for all_gather to complete and copy results back into original parameter tensors.
         for info in all_gather_infos:
@@ -736,6 +738,370 @@ class DistAdam(torch.optim.Optimizer):
 
         self._reduce_scatter_futures.clear()
         torch.futures.collect_all(all_gather_futures).wait()
+
+
+class DistAdEMAMix(torch.optim.Optimizer):
+    """
+    Distributed AdEMAMix optimizer: https://arxiv.org/abs/2409.03137
+
+    AdEMAMix uses two EMAs for gradient accumulation:
+    - Fast EMA (beta1): handles immediate gradients (like standard momentum)
+    - Slow EMA (beta3): remembers gradients from thousands of steps back
+
+    The combined gradient is: m_fast + alpha * m_slow
+    This allows the optimizer to tunnel through noise plateaus by retaining
+    long-term directional information that standard momentum forgets.
+    """
+    def __init__(
+        self,
+        params,
+        lr: float = 1e-3,
+        betas: tuple[float, float, float] = (0.9, 0.999, 0.9999),
+        alpha: float = 5.0,
+        eps: float = 1e-8,
+        weight_decay: float = 0.01,
+        alpha_warmup_steps: int = 1000,
+        beta3_warmup_steps: int = 1000
+    ):
+        """
+        Args:
+            lr: Learning rate
+            betas: (beta1, beta2, beta3) where:
+                - beta1: Fast momentum decay (default 0.9)
+                - beta2: Second moment decay (default 0.999)
+                - beta3: Slow momentum decay (default 0.9999)
+            alpha: Mixing coefficient for slow EMA (default 5.0)
+            eps: Epsilon for numerical stability
+            weight_decay: Weight decay coefficient
+            alpha_warmup_steps: Steps to warm up alpha from 0 to target
+            beta3_warmup_steps: Steps to warm up beta3 from beta1 to target
+        """
+        self.world_size = dist.get_world_size() if dist.is_initialized() else 1
+        beta1, beta2, beta3 = betas
+        defaults = dict(
+            lr=lr,
+            beta1=beta1,
+            beta2=beta2,
+            beta3=beta3,
+            target_alpha=alpha,
+            target_beta3=beta3,
+            eps=eps,
+            weight_decay=weight_decay,
+            alpha_warmup_steps=alpha_warmup_steps,
+            beta3_warmup_steps=beta3_warmup_steps
+        )
+        params = list(params)
+        sizes = {p.shape for p in params}
+        # create one buffer per unique parameter-size
+        param_groups = []
+        for size in sizes:
+            group_params = [p for p in params if p.shape == size]
+            param_groups.append(dict(params=group_params))
+        super().__init__(param_groups, defaults)
+        # init state
+        for p in params:
+            chunk_size = p.size(0) // self.world_size
+            exp_avg_fast = torch.zeros_like(p[:chunk_size], dtype=torch.bfloat16, device=p[0].device)
+            exp_avg_slow = torch.zeros_like(p[:chunk_size], dtype=torch.bfloat16, device=p[0].device)
+            exp_avg_sq = torch.zeros_like(p[:chunk_size], dtype=torch.bfloat16, device=p[0].device)
+            self.state[p] = dict(
+                step=0,
+                exp_avg_fast=exp_avg_fast,
+                exp_avg_slow=exp_avg_slow,
+                exp_avg_sq=exp_avg_sq
+            )
+
+        self.should_sync = False
+        self._reduce_scatter_hooks = []
+        self._reduce_scatter_futures = {}
+        self.register_backward_hooks()
+
+    def register_backward_hooks(self):
+        for group in self.param_groups:
+            params: list[Tensor] = group["params"]
+            for param in params:
+                hook = param.register_post_accumulate_grad_hook(self._sync_gradient)
+                self._reduce_scatter_hooks.append(hook)
+
+    @torch.compile
+    @torch.no_grad()
+    def _sync_gradient(self, param):
+        if not self.should_sync:
+            return
+
+        grad = param.grad
+        rank_size = grad.shape[0] // self.world_size
+        grad_slice = torch.empty_like(grad[:rank_size])
+        self._reduce_scatter_futures[param] = (
+            dist.reduce_scatter_tensor(grad_slice, grad, op=dist.ReduceOp.AVG, async_op=True).get_future(),
+            grad_slice
+        )
+
+    @torch.compile
+    @torch.no_grad()
+    def step(self):
+        rank = dist.get_rank()
+        all_gather_futures: list[torch.Future] = []
+
+        for group in reversed(self.param_groups):
+            beta1 = group['beta1']
+            beta2 = group['beta2']
+            target_beta3 = group['target_beta3']
+            target_alpha = group['target_alpha']
+            eps = group['eps']
+            wd = group['weight_decay']
+            alpha_warmup = group['alpha_warmup_steps']
+            beta3_warmup = group['beta3_warmup_steps']
+
+            for param in reversed(group['params']):
+                if param not in self._reduce_scatter_futures:
+                    continue
+
+                fut, g_slice = self._reduce_scatter_futures[param]
+                fut.wait()
+
+                rank_size = param.shape[0] // self.world_size
+                p_slice = param[rank * rank_size:(rank + 1) * rank_size]
+                lr = group['lr'] * getattr(param, "lr_mul", 1.0)
+                state = self.state[param]
+
+                exp_avg_fast = state["exp_avg_fast"]
+                exp_avg_slow = state["exp_avg_slow"]
+                exp_avg_sq = state["exp_avg_sq"]
+                state["step"] += 1
+                t = state["step"]
+
+                # Warmup schedules for alpha and beta3
+                # Gradually increase from 0 to target_alpha
+                if t < alpha_warmup:
+                    alpha = target_alpha * (t / alpha_warmup)
+                else:
+                    alpha = target_alpha
+
+                # Gradually increase beta3 from beta1 to target_beta3
+                if t < beta3_warmup:
+                    beta3 = beta1 + (target_beta3 - beta1) * (t / beta3_warmup)
+                else:
+                    beta3 = target_beta3
+
+                # weight decay
+                if wd != 0:
+                    eff_weight_decay = lr * wd * getattr(param, "wd_mul", 1.0)
+                    p_slice.mul_(1 - eff_weight_decay)
+
+                # Update fast EMA (with bias correction like standard Adam)
+                exp_avg_fast.mul_(beta1).add_(g_slice, alpha=1 - beta1)
+
+                # Update slow EMA (no bias correction, as per paper)
+                exp_avg_slow.mul_(beta3).add_(g_slice, alpha=1 - beta3)
+
+                # Update second moment
+                exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+
+                # Bias corrections (only for fast EMA and second moment)
+                bias1 = 1 - beta1 ** t
+                bias2 = 1 - beta2 ** t
+
+                # Combined gradient: m_fast + alpha * m_slow
+                combined_grad = exp_avg_fast.div(bias1).add(exp_avg_slow, alpha=alpha)
+
+                # compute step
+                denom = exp_avg_sq.sqrt().div(bias2 ** 0.5).add_(eps)
+                update = combined_grad.div(denom).mul_(lr)
+                p_slice.add_(other=update, alpha=-1.0)
+
+                all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
+
+        self._reduce_scatter_futures.clear()
+        torch.futures.collect_all(all_gather_futures).wait()
+
+
+class ScheduleFreeWrapper:
+    """
+    Schedule-Free Optimization wrapper: https://github.com/facebookresearch/schedule_free
+
+    Maintains two parameter sequences:
+    - z (explorer): receives gradient updates with constant high LR
+    - x (average): exponential moving average of z for evaluation
+
+    This eliminates the need for LR decay while achieving similar or better
+    final performance. The explorer sequence aggressively searches the loss
+    landscape while the average sequence provides a stable, well-generalized
+    solution.
+    """
+    def __init__(self, optimizer, beta: float = 0.9):
+        """
+        Args:
+            optimizer: Base optimizer to wrap (e.g., DistAdam, DistAdEMAMix)
+            beta: Interpolation coefficient (default 0.9)
+                  Higher values keep eval closer to training trajectory
+        """
+        self.optimizer = optimizer
+        self.beta = beta
+        self.param_groups = optimizer.param_groups
+
+        # Store original parameters as x (average)
+        # Clone current params to create z (explorer)
+        for group in self.param_groups:
+            for p in group['params']:
+                state = self.optimizer.state[p]
+                state['x'] = p.data.clone()
+                state['z'] = p.data.clone()
+
+        self._in_train_mode = True
+
+    def train(self):
+        """Switch to training mode: use z (explorer) parameters"""
+        if not self._in_train_mode:
+            for group in self.param_groups:
+                for p in group['params']:
+                    state = self.optimizer.state[p]
+                    # Save x, load z
+                    state['x'].copy_(p.data)
+                    p.data.copy_(state['z'])
+            self._in_train_mode = True
+
+    def eval(self):
+        """Switch to eval mode: use x (average) parameters"""
+        if self._in_train_mode:
+            for group in self.param_groups:
+                for p in group['params']:
+                    state = self.optimizer.state[p]
+                    # Save z, load x
+                    state['z'].copy_(p.data)
+                    p.data.copy_(state['x'])
+            self._in_train_mode = False
+
+    def step(self):
+        """Perform optimizer step and update averages"""
+        # Ensure we're in train mode
+        assert self._in_train_mode, "Must call .train() before stepping"
+
+        # Step the underlying optimizer (updates z)
+        self.optimizer.step()
+
+        # Update x as exponential moving average of z
+        for group in self.param_groups:
+            for p in group['params']:
+                state = self.optimizer.state[p]
+                # x_new = (1 - beta) * x_old + beta * z_new
+                state['x'].mul_(1 - self.beta).add_(p.data, alpha=self.beta)
+
+    def zero_grad(self, set_to_none=True):
+        """Zero gradients"""
+        self.optimizer.zero_grad(set_to_none=set_to_none)
+
+    @property
+    def should_sync(self):
+        return self.optimizer.should_sync
+
+    @should_sync.setter
+    def should_sync(self, value):
+        self.optimizer.should_sync = value
+
+    def state_dict(self):
+        """Get optimizer state including x and z sequences"""
+        base_state = self.optimizer.state_dict()
+        base_state['schedule_free_beta'] = self.beta
+        base_state['schedule_free_train_mode'] = self._in_train_mode
+        return base_state
+
+    def load_state_dict(self, state_dict):
+        """Load optimizer state including x and z sequences"""
+        self.beta = state_dict.pop('schedule_free_beta', self.beta)
+        self._in_train_mode = state_dict.pop('schedule_free_train_mode', True)
+        self.optimizer.load_state_dict(state_dict)
+
+
+class OptimizerSwitcher:
+    """
+    Manages switching between optimizers mid-training.
+
+    This allows transitioning from one optimizer to another at a specified step,
+    useful for strategies like:
+    - Start with Adam for initial exploration
+    - Switch to AdEMAMix to break through plateaus
+    - Switch to Muon for final convergence
+    """
+    def __init__(self, optimizers_dict: dict, initial_optimizer: str):
+        """
+        Args:
+            optimizers_dict: Dict mapping names to optimizer instances
+                Example: {'adam': optimizer1, 'ademamix': optimizer2}
+            initial_optimizer: Name of optimizer to start with
+        """
+        self.optimizers_dict = optimizers_dict
+        self.current_name = initial_optimizer
+        self.current = optimizers_dict[initial_optimizer]
+        self.param_groups = self.current.param_groups
+
+    def switch_to(self, optimizer_name: str, transfer_momentum: bool = False):
+        """
+        Switch to a different optimizer.
+
+        Args:
+            optimizer_name: Name of optimizer to switch to
+            transfer_momentum: If True, attempt to transfer momentum buffers
+        """
+        if optimizer_name == self.current_name:
+            return
+
+        old_optimizer = self.current
+        new_optimizer = self.optimizers_dict[optimizer_name]
+
+        # Transfer momentum if requested and possible
+        if transfer_momentum:
+            for old_group, new_group in zip(old_optimizer.param_groups, new_optimizer.param_groups):
+                for old_p, new_p in zip(old_group['params'], new_group['params']):
+                    if old_p is not new_p:
+                        continue
+                    old_state = old_optimizer.state.get(old_p, {})
+                    new_state = new_optimizer.state.get(new_p, {})
+
+                    # Transfer exp_avg if both have it
+                    if 'exp_avg' in old_state and 'exp_avg' in new_state:
+                        new_state['exp_avg'].copy_(old_state['exp_avg'])
+                    # Transfer exp_avg_fast to exp_avg for AdEMAMix -> Adam
+                    elif 'exp_avg_fast' in old_state and 'exp_avg' in new_state:
+                        new_state['exp_avg'].copy_(old_state['exp_avg_fast'])
+                    # Transfer exp_avg to exp_avg_fast for Adam -> AdEMAMix
+                    elif 'exp_avg' in old_state and 'exp_avg_fast' in new_state:
+                        new_state['exp_avg_fast'].copy_(old_state['exp_avg'])
+
+        self.current_name = optimizer_name
+        self.current = new_optimizer
+        self.param_groups = new_optimizer.param_groups
+
+    def step(self):
+        """Step current optimizer"""
+        self.current.step()
+
+    def zero_grad(self, set_to_none=True):
+        """Zero gradients on current optimizer"""
+        self.current.zero_grad(set_to_none=set_to_none)
+
+    @property
+    def should_sync(self):
+        return self.current.should_sync
+
+    @should_sync.setter
+    def should_sync(self, value):
+        self.current.should_sync = value
+
+    def state_dict(self):
+        """Get state dict for all optimizers"""
+        return {
+            'current_name': self.current_name,
+            'optimizers': {name: opt.state_dict() for name, opt in self.optimizers_dict.items()}
+        }
+
+    def load_state_dict(self, state_dict):
+        """Load state dict for all optimizers"""
+        self.current_name = state_dict['current_name']
+        for name, opt_state in state_dict['optimizers'].items():
+            self.optimizers_dict[name].load_state_dict(opt_state)
+        self.current = self.optimizers_dict[self.current_name]
+        self.param_groups = self.current.param_groups
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
@@ -1233,6 +1599,19 @@ class Hyperparameters:
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
+    # optimizer selection
+    scalar_optimizer: str = "adam"  # "adam" or "ademamix"
+    use_schedule_free: bool = False  # wrap optimizer in schedule-free wrapper
+    schedule_free_beta: float = 0.9  # beta for schedule-free (if enabled)
+    # ademamix parameters (only used if scalar_optimizer == "ademamix")
+    ademamix_beta3: float = 0.9999  # slow momentum decay
+    ademamix_alpha: float = 5.0  # slow EMA mixing coefficient
+    ademamix_alpha_warmup_steps: int = 1000
+    ademamix_beta3_warmup_steps: int = 1000
+    # optimizer switching
+    switch_optimizer_at_step: int = -1  # step to switch optimizer (-1 = no switching)
+    switch_to_optimizer: str = "ademamix"  # optimizer to switch to
+    switch_transfer_momentum: bool = True  # transfer momentum when switching
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
@@ -1242,21 +1621,6 @@ class Hyperparameters:
     ws_schedule: tuple = (3, 7, 11)
     ws_final: int = 13 # increase final validation ws, used for YaRN extension and short window size @classiclarryd
     ws_validate_post_yarn_ext: int = 20 # extend long windows out even further after applying YaRN
-
-    # [NEW] The Switch
-    # Switch to AdEMAMix when the loss usually starts to plateau.
-    # Based on your graph, the deceleration hits hard around 30-40% through? 
-    # Let's say step 500 for a 2200 step run, or earlier if you want to prevent the plateau.
-    # Let's try switching at 70% of training.
-    switch_step: int = 500 
-    
-    # AdEMAMix params
-    ademamix_beta3: float = 0.9995 # The "Slow" memory
-    ademamix_alpha: float = 5.0    # How much we trust the slow memory
-    
-    # Schedule Free LR (The constant LR to hold during the second phase)
-    # Usually 1/10th or 1/5th of max LR
-    post_switch_lr_scale: float = 0.25
 
 args = Hyperparameters()
 
@@ -1328,35 +1692,51 @@ gate_params = [p for n, p in model.named_parameters() if "gate" in n]
 # init the optimizer(s)
 # small adam epsilon by @YouJiacheng. this is an alternate method of fixing the world_size dependence
 # discovered by @fernbear.bsky.social https://x.com/hi_tysam/status/1879692937589875094
-optimizer1 = DistAdam(
-    scalar_params + head_params + embed_params,
-    lr=0.008,
-    betas=(0.65, 0.95),
-    eps=1e-8,
-    weight_decay=0.0,
-)
-optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
-optimizers = [optimizer1, optimizer2]
+
+def create_optimizers(optimizer_name):
+    """Helper to create optimizers based on name"""
+    if optimizer_name == "adam":
+        opt1 = DistAdam(
+            scalar_params + head_params + embed_params,
+            lr=0.008,
+            betas=(0.65, 0.95),
+            eps=1e-8,
+            weight_decay=0.0,
+        )
+        opt2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
+        return [opt1, opt2]
+    elif optimizer_name == "ademamix":
+        # AdEMAMix for all parameters
+        opt = DistAdEMAMix(
+            list(model.parameters()),
+            lr=0.008,
+            betas=(0.65, 0.95, args.ademamix_beta3),
+            alpha=args.ademamix_alpha,
+            eps=1e-8,
+            weight_decay=0.0,
+            alpha_warmup_steps=args.ademamix_alpha_warmup_steps,
+            beta3_warmup_steps=args.ademamix_beta3_warmup_steps,
+        )
+        if args.use_schedule_free:
+            opt = ScheduleFreeWrapper(opt, beta=args.schedule_free_beta)
+        return [opt]
+    else:
+        raise ValueError(f"Unknown optimizer: {optimizer_name}")
+
+# Create initial optimizers
+optimizers = create_optimizers(args.scalar_optimizer)
 for opt in optimizers:
     for group in opt.param_groups:
         group["initial_lr"] = group["lr"]
 
 # learning rate schedule: flat, then linear decay, then flat
 def get_lr(step: int):
-    # If we are in the AdEMAMix phase, hold LR steady (Schedule-Free style)
-    # We don't want to decay to zero, we want to let the averaging do the work.
-    if step >= args.switch_step:
-        # Use a constant, slightly lower learning rate to let the slow buffer take over
-        return args.post_switch_lr_scale
-        
-    x = min(0.9999, step / args.switch_step) # Scale warmup to the switch point
+    x = min(0.9999, step / args.num_scheduled_iterations)
     assert 0 <= x < 1
     lr = 1.0
-    # Standard linear warmup/cooldown logic, but targeted at switch_step
-    # You might want to remove cooldown here and just have it linear warmup -> flat
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
-        lr = w * 1.0 + (1 - w) * args.post_switch_lr_scale
+        lr = w * 1.0 + (1 - w) * 0.1
     return lr
 
 def get_ws(step: int):
@@ -1385,32 +1765,33 @@ def get_muon_momentum(step: int, muon_warmup_steps=300, muon_cooldown_steps=50, 
 
 def step_optimizers(step: int, optimizers, model):
     # update lr
-    lr_scale = get_lr(step)
     for optimizer in optimizers:
         for group in optimizer.param_groups:
-            group["lr"] = group["initial_lr"] * lr_scale
+            group["lr"] = group["initial_lr"] * get_lr(step)
 
-    # set muon momentum based on step (keep your existing logic)
-    momentum = get_muon_momentum(step)
-    for group in optimizers[1].param_groups:
-        group["momentum"] = momentum
+    # If using dual optimizer setup (Adam + Muon)
+    if len(optimizers) == 2:
+        # set muon momentum based on step
+        momentum = get_muon_momentum(step)
+        for group in optimizers[1].param_groups:
+            group["momentum"] = momentum
 
-    # [NEW] Determine Switch State
-    use_ademamix = (step >= args.switch_step)
-
-    # on even steps, only step Muon params
-    if step % 2 == 0:
-        # Pass the switch flag to NorMuon
-        optimizers[1].step(use_ademamix=use_ademamix)
-        optimizers[1].zero_grad(set_to_none=True)
-    else:
-        for optimizer in optimizers:
-            if isinstance(optimizer, NorMuon):
-                optimizer.step(use_ademamix=use_ademamix)
-            else:
+        # on even steps, only step Muon params
+        # on odd steps, step all params
+        if step%2==0:
+            optimizers[1].step()
+            optimizers[1].zero_grad(set_to_none=True)
+        else:
+            for optimizer in optimizers:
                 optimizer.step()
+            model.zero_grad(set_to_none=True)
+            # disable sync in the next training step for the adam optimizer
+            optimizers[0].should_sync = False
+    else:
+        # Single optimizer (e.g., AdEMAMix for all params)
+        for optimizer in optimizers:
+            optimizer.step()
         model.zero_grad(set_to_none=True)
-        optimizers[0].should_sync = False
 
 model: nn.Module = torch.compile(model, dynamic=False, fullgraph=True)
 
@@ -1442,7 +1823,8 @@ for step in range(warmup_steps):
     model.zero_grad(set_to_none=True)
 model.yarn.reset() # rotary buffer is not stored in state_dict
 model.load_state_dict(initial_state["model"])
-optimizer2.reset() # muon momentum buffers not in state dict
+if len(optimizers) > 1:
+    optimizers[1].reset() # muon momentum buffers not in state dict
 for opt, opt_state in zip(optimizers, initial_state["optimizers"]):
     opt.load_state_dict(opt_state)
 del train_loader, initial_state
@@ -1466,6 +1848,15 @@ for step in range(train_steps + 1):
         model.yarn.apply(ws_long, new_ws_long)
         ws_long=new_ws_long
 
+    # --------------- OPTIMIZER SWITCHING -----------------
+    if args.switch_optimizer_at_step == step:
+        print0(f"Switching optimizer from {args.scalar_optimizer} to {args.switch_to_optimizer} at step {step}", console=True)
+        # Create new optimizers
+        optimizers = create_optimizers(args.switch_to_optimizer)
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["initial_lr"] = group["lr"]
+
     # --------------- VALIDATION SECTION -----------------
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:
@@ -1473,6 +1864,10 @@ for step in range(train_steps + 1):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
+        # Switch to eval mode for schedule-free optimizers
+        for opt in optimizers:
+            if isinstance(opt, ScheduleFreeWrapper):
+                opt.eval()
         model.eval()
         assert args.val_tokens % args.val_batch_size == 0
         val_steps = grad_accum_steps * args.val_tokens // args.val_batch_size
@@ -1486,6 +1881,10 @@ for step in range(train_steps + 1):
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        # Switch back to train mode for schedule-free optimizers
+        for opt in optimizers:
+            if isinstance(opt, ScheduleFreeWrapper):
+                opt.train()
         model.train()
         # start the clock again
         torch.cuda.synchronize()
