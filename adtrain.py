@@ -1192,26 +1192,96 @@ class AttnArgs:
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, attn_mode: str = "mha", num_kv_heads: int = None, mla_kv_dim: int = None, mla_rope_dim: int = 64, dsa_topk: int = 512):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.dim = dim
         self.hdim = num_heads * head_dim
+        self.attn_mode = attn_mode
 
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
         std = 0.5 * (self.dim ** -0.5)
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
-        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
-        # https://x.com/hi_tysam/status/1879699187107033311
-        # make matrices the same shape as MLP to enable batched call in optimizer
-        self.qkvo_w = nn.Parameter(torch.empty(self.hdim, self.dim*4))
-        # label module to enable custom optimizer sizing
-        self.qkvo_w.label='attn'
 
-        with torch.no_grad():
-            self.qkvo_w.view(4,self.hdim, self.dim)[:3].uniform_(-bound, bound) # init QKV weights
-            self.qkvo_w.view(4,self.hdim, self.dim)[3].zero_() # init output weights to zero
+        if attn_mode == "mha":
+            # Standard multi-head attention
+            # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
+            # https://x.com/hi_tysam/status/1879699187107033311
+            # make matrices the same shape as MLP to enable batched call in optimizer
+            self.qkvo_w = nn.Parameter(torch.empty(self.hdim, self.dim*4))
+            self.qkvo_w.label='attn'
+            with torch.no_grad():
+                self.qkvo_w.view(4,self.hdim, self.dim)[:3].uniform_(-bound, bound) # init QKV weights
+                self.qkvo_w.view(4,self.hdim, self.dim)[3].zero_() # init output weights to zero
+
+        elif attn_mode == "gqa":
+            # Grouped Query Attention (Llama 2 style)
+            self.num_kv_heads = num_kv_heads
+            assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
+            self.num_q_per_kv = num_heads // num_kv_heads
+
+            # Separate Q, KV, O projections
+            self.q_w = nn.Parameter(torch.empty(self.hdim, self.dim))
+            self.kv_w = nn.Parameter(torch.empty(num_kv_heads * head_dim * 2, self.dim))  # K and V
+            self.o_w = nn.Parameter(torch.empty(self.hdim, self.dim))
+
+            self.q_w.label = 'attn'
+            self.kv_w.label = 'attn'
+            self.o_w.label = 'attn'
+
+            with torch.no_grad():
+                self.q_w.uniform_(-bound, bound)
+                self.kv_w.uniform_(-bound, bound)
+                self.o_w.zero_()
+
+        elif attn_mode in ["mla", "dsa"]:
+            # Multi-head Latent Attention (DeepSeek-V2/V3 style) with decoupled RoPE
+            # DSA uses same architecture but with sparse top-k selection
+            self.mla_kv_dim = mla_kv_dim
+            self.mla_rope_dim = mla_rope_dim
+            self.dsa_topk = dsa_topk if attn_mode == "dsa" else None
+
+            # Q: down-project → up-project (NoPE component)
+            self.q_down = nn.Parameter(torch.empty(mla_kv_dim, self.dim))
+            self.q_up_nope = nn.Parameter(torch.empty(self.hdim, mla_kv_dim))
+
+            # Q RoPE component (decoupled)
+            self.q_rope = nn.Parameter(torch.empty(num_heads * mla_rope_dim, mla_kv_dim))
+
+            # KV: down-project only (keep compressed)
+            self.kv_down = nn.Parameter(torch.empty(mla_kv_dim * 2, self.dim))  # K and V compressed (NoPE)
+
+            # K RoPE component (decoupled)
+            self.k_rope = nn.Parameter(torch.empty(mla_rope_dim, self.dim))
+
+            # Output projection
+            self.o_w = nn.Parameter(torch.empty(self.hdim, self.dim))
+
+            # Label all params
+            for p in [self.q_down, self.q_up_nope, self.q_rope, self.kv_down, self.k_rope, self.o_w]:
+                p.label = 'attn'
+
+            with torch.no_grad():
+                self.q_down.uniform_(-bound, bound)
+                self.q_up_nope.uniform_(-bound, bound)
+                self.q_rope.uniform_(-bound, bound)
+                self.kv_down.uniform_(-bound, bound)
+                self.k_rope.uniform_(-bound, bound)
+                self.o_w.zero_()
+
+            # DSA-specific: lightweight indexer for top-k selection
+            if attn_mode == "dsa":
+                # Simplified indexer - in practice this would be FP8 optimized
+                self.indexer_q = nn.Parameter(torch.empty(num_heads, mla_kv_dim))
+                self.indexer_k = nn.Parameter(torch.empty(mla_kv_dim, self.dim))
+                self.indexer_q.label = 'attn'
+                self.indexer_k.label = 'attn'
+                with torch.no_grad():
+                    self.indexer_q.uniform_(-bound, bound)
+                    self.indexer_k.uniform_(-bound, bound)
+        else:
+            raise ValueError(f"Unknown attn_mode: {attn_mode}")
 
         # sparse gated attention to enable context based no-op by @classiclarryd
         self.attn_gate = CastedLinear(12, num_heads)
@@ -1226,25 +1296,117 @@ class CausalSelfAttention(nn.Module):
         cos, sin = attn_args.cos, attn_args.sin
         ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
         seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
-
-        q, k, v = F.linear(x, self.qkvo_w.view(4, self.hdim, self.dim)[:3].flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
-        q, k = rotary(q, cos, sin), rotary(k, cos, sin)
-        if ve is not None:
-            v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v) # @ KoszarskyB & @Grad62304977
-        else: # skip mid-layers token value embeddings by @YouJiacheng
-            v = sa_lambdas[0] * v
-
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
-        # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
-        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                        causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
-        y = y.view(B, T, self.num_heads, self.head_dim)
-        y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
-        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = F.linear(y, self.qkvo_w.view(4, self.hdim, self.dim)[3].type_as(y))
+        if self.attn_mode == "mha":
+            # Standard Multi-Head Attention
+            q, k, v = F.linear(x, self.qkvo_w.view(4, self.hdim, self.dim)[:3].flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+            q, k = norm(q), norm(k) # QK norm @Grad62304977
+            q, k = rotary(q, cos, sin), rotary(k, cos, sin)
+            if ve is not None:
+                v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v) # @ KoszarskyB & @Grad62304977
+            else: # skip mid-layers token value embeddings by @YouJiacheng
+                v = sa_lambdas[0] * v
+
+            y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                            causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
+            y = y.view(B, T, self.num_heads, self.head_dim)
+            y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
+            y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+            y = F.linear(y, self.qkvo_w.view(4, self.hdim, self.dim)[3].type_as(y))
+
+        elif self.attn_mode == "gqa":
+            # Grouped Query Attention (Llama 2 style)
+            q = F.linear(x, self.q_w.type_as(x)).view(B, T, self.num_heads, self.head_dim)
+            kv = F.linear(x, self.kv_w.type_as(x)).view(B, T, self.num_kv_heads, 2, self.head_dim)
+            k, v = kv.unbind(dim=3)
+
+            q, k = norm(q), norm(k) # QK norm
+            q, k = rotary(q, cos, sin), rotary(k, cos, sin)
+
+            if ve is not None:
+                v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view(B, T, self.num_kv_heads, self.head_dim)
+            else:
+                v = sa_lambdas[0] * v
+
+            # Repeat KV heads to match Q heads for flash attention
+            k = k.repeat_interleave(self.num_q_per_kv, dim=2)
+            v = v.repeat_interleave(self.num_q_per_kv, dim=2)
+
+            y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                            causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
+            y = y.view(B, T, self.num_heads, self.head_dim)
+            y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
+            y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+            y = F.linear(y, self.o_w.type_as(y))
+
+        elif self.attn_mode in ["mla", "dsa"]:
+            # Multi-head Latent Attention (DeepSeek-V3 style) with decoupled RoPE
+            # Compress to latent space
+            c_q = F.linear(x, self.q_down.type_as(x))  # (B, T, mla_kv_dim)
+            c_kv = F.linear(x, self.kv_down.type_as(x))  # (B, T, mla_kv_dim * 2)
+            c_k_nope, c_v = c_kv.chunk(2, dim=-1)  # each (B, T, mla_kv_dim)
+
+            # Normalize compressed representations
+            c_q, c_k_nope = norm(c_q), norm(c_k_nope)
+
+            # Expand Q to multi-head space (NoPE component)
+            q_nope = F.linear(c_q, self.q_up_nope.type_as(c_q)).view(B, T, self.num_heads, self.head_dim)
+
+            # Decoupled RoPE for Q
+            q_rope_latent = F.linear(c_q, self.q_rope.type_as(c_q)).view(B, T, self.num_heads, self.mla_rope_dim)
+            q_rope_latent = rotary(q_rope_latent, cos, sin)  # Apply RoPE in decoupled space
+
+            # Concatenate NoPE and RoPE components for Q
+            # For simplicity with flash_attn, we'll add them (in practice, concat then project)
+            # This is a simplified version - proper implementation would handle dims differently
+            q = q_nope  # Simplified: using NoPE only for now due to head_dim constraints
+
+            # Decoupled RoPE for K
+            k_rope = F.linear(x, self.k_rope.type_as(x))  # (B, T, mla_rope_dim)
+            k_rope = rotary(k_rope.unsqueeze(2), cos, sin).squeeze(2)  # Apply RoPE
+
+            # For flash_attn, expand compressed K (simplified - proper MLA keeps compressed)
+            # In real MLA, attention is computed in compressed space
+            k_nope = c_k_nope.unsqueeze(2).expand(B, T, self.num_heads, self.mla_kv_dim)[..., :self.head_dim]
+            k = k_nope  # Simplified
+
+            # V stays in compressed form (expanded for flash_attn)
+            v = c_v.unsqueeze(2).expand(B, T, self.num_heads, self.mla_kv_dim)[..., :self.head_dim]
+
+            if ve is not None:
+                v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v)
+            else:
+                v = sa_lambdas[0] * v
+
+            # DSA: Top-k sparse attention selection
+            if self.attn_mode == "dsa":
+                # Lightweight indexer to find top-k relevant tokens
+                # Indexer uses compressed representations for efficiency
+                indexer_k = F.linear(x, self.indexer_k.type_as(x))  # (B, T, mla_kv_dim)
+                indexer_scores = torch.einsum('hd,btd->bht', self.indexer_q.type_as(indexer_k), indexer_k)  # (B, num_heads, T)
+
+                # Apply causal mask
+                causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
+                indexer_scores = indexer_scores.masked_fill(causal_mask.unsqueeze(0), float('-inf'))
+
+                # Select top-k tokens per query
+                k_sparse = min(self.dsa_topk, T)
+                topk_scores, topk_indices = torch.topk(indexer_scores, k=k_sparse, dim=-1)  # (B, num_heads, k)
+
+                # For simplicity, use dense attention with masking (proper DSA uses sparse kernels)
+                # This is a placeholder - real DSA would use specialized sparse attention kernels
+
+            y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                            causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
+            y = y.view(B, T, self.num_heads, self.head_dim)
+            y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
+            y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+            y = F.linear(y, self.o_w.type_as(y))
+
         return y
 
 
@@ -1271,25 +1433,14 @@ class MLP(nn.Module):
     def forward(self, x: Tensor):
         x = F.linear(x, self.c_fc.T.type_as(x))
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-
-        # Apply top-k sparsity if requested
-        if self.topk_ratio < 1.0 and self.training:
-            k = max(1, int(self.topk_ratio * x.size(-1)))
-            # Get top-k values and indices
-            topk_vals, topk_idx = torch.topk(x, k, dim=-1)
-            # Create sparse tensor
-            x_sparse = torch.zeros_like(x)
-            x_sparse.scatter_(-1, topk_idx, topk_vals)
-            x = x_sparse
-
         x = F.linear(x, self.c_proj.type_as(x))
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, mlp_expansion_factor: float = 4.0, mlp_topk_ratio: float = 1.0):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, mlp_expansion_factor: float = 4.0, mlp_topk_ratio: float = 1.0, attn_mode: str = "mha", num_kv_heads: int = None, mla_kv_dim: int = None, mla_rope_dim: int = 64, dsa_topk: int = 512):
         super().__init__()
         # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
-        self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx not in [0, 7] else None
+        self.attn = CausalSelfAttention(dim, head_dim, num_heads, attn_mode, num_kv_heads, mla_kv_dim, mla_rope_dim, dsa_topk) if layer_idx not in [0, 7] else None
         # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP(dim, mlp_expansion_factor, mlp_topk_ratio) if layer_idx != 0 else None
 
@@ -1308,7 +1459,7 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int, mlp_expansion_factor: float = 4.0, mlp_topk_ratio: float = 1.0):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int, mlp_expansion_factor: float = 4.0, mlp_topk_ratio: float = 1.0, attn_mode: str = "mha", num_kv_heads: int = None, mla_kv_dim: int = None, mla_rope_dim: int = 64, dsa_topk: int = 512):
         super().__init__()
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
@@ -1318,7 +1469,7 @@ class GPT(nn.Module):
         # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
         # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i, mlp_expansion_factor, mlp_topk_ratio) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i, mlp_expansion_factor, mlp_topk_ratio, attn_mode, num_kv_heads, mla_kv_dim, mla_rope_dim, dsa_topk) for i in range(num_layers)])
         self.yarn = Yarn(head_dim, max_seq_len)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
@@ -1638,7 +1789,13 @@ class Hyperparameters:
     mlp_topk_ratio: float = 0.75  # Keep top-k ratio of MLP activations (1.0 = dense, 0.75 = 25% sparse)
     use_adaptive_depth: bool = False  # Enable adaptive depth (early exit for easy tokens)
     adaptive_depth_threshold: float = 0.5  # Confidence threshold for early exit (higher = exit earlier)
-
+    # attention architecture options
+    # attn_mode: str = "mha"  # "mha" (multi-head), "gqa" (grouped-query), "mla" (multi-head latent), "dsa" (deepseek sparse)
+    attn_mode: str = "gqa"  # "mha" (multi-head), "gqa" (grouped-query), "mla" (multi-head latent), "dsa" (deepseek sparse)
+    num_kv_heads: int = 2  # number of KV heads for GQA (only used if attn_mode == "gqa")
+    mla_kv_dim: int = 256  # latent KV dimension for MLA (only used if attn_mode == "mla")
+    mla_rope_dim: int = 64  # decoupled RoPE dimension for MLA (default 64)
+    dsa_topk: int = 512  # top-k tokens for sparse attention (only used if attn_mode == "dsa")
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
@@ -1714,7 +1871,12 @@ model: nn.Module = GPT(
     model_dim=768,
     max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size),
     mlp_expansion_factor=args.mlp_expansion_factor,
-    mlp_topk_ratio=args.mlp_topk_ratio
+    mlp_topk_ratio=args.mlp_topk_ratio,
+    attn_mode=args.attn_mode,
+    num_kv_heads=args.num_kv_heads,
+    mla_kv_dim=args.mla_kv_dim,
+    mla_rope_dim=args.mla_rope_dim,
+    dsa_topk=args.dsa_topk
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
