@@ -903,12 +903,14 @@ class DistAdEMAMix(torch.optim.Optimizer):
                 bias2 = 1 - beta2 ** t
 
                 # Combined gradient: m_fast + alpha * m_slow
-                combined_grad = exp_avg_fast.div(bias1).add(exp_avg_slow, alpha=alpha)
+                # IMPORTANT: Use non-mutating operations to avoid corrupting buffers
+                m_fast_corrected = exp_avg_fast / bias1
+                combined_grad = m_fast_corrected + alpha * exp_avg_slow
 
                 # compute step
-                denom = exp_avg_sq.sqrt().div(bias2 ** 0.5).add_(eps)
-                update = combined_grad.div(denom).mul_(lr)
-                p_slice.add_(other=update, alpha=-1.0)
+                denom = (exp_avg_sq.sqrt() / (bias2 ** 0.5)) + eps
+                update = combined_grad / denom
+                p_slice.add_(update, alpha=-lr)
 
                 all_gather_futures.append(dist.all_gather_into_tensor(param, p_slice, async_op=True).get_future())
 
@@ -1937,10 +1939,10 @@ for step in range(train_steps + 1):
         new_opt2 = DistAdEMAMix(
             hidden_matrix_params + gate_params,
             lr=0.03,
-            betas=(0.95, 0.95, args.ademamix_beta3),
+            betas=(0.9, 0.999, args.ademamix_beta3),
             alpha=args.ademamix_alpha,
             eps=1e-8,
-            weight_decay=1.2,
+            weight_decay=0.0,  # Match the create_optimizers settings
             alpha_warmup_steps=args.ademamix_alpha_warmup_steps,
             beta3_warmup_steps=args.ademamix_beta3_warmup_steps,
         )
