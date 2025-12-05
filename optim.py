@@ -221,7 +221,7 @@ def build_polar_express_coeffs_with_small_preservation(
 
 if __name__ == "__main__":
     # Example: roughly reproduce your setup and then refine.
-    num_iters = 5
+    num_iters = 9
     safety_factor = 2e-2
     # NOTE: cushion=2 only makes sense if you have modified the appendix-G code.
     # Here we stick with the original-style cushion < 1. You can tinker with it.
@@ -237,18 +237,19 @@ if __name__ == "__main__":
         (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
         (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
     ]
-
+    """
     # Directly refine these, instead of calling optimal_composition(...)
     coeffs = refine_with_small_singular_preservation(
         coeffs=polar_express_coeffs,
         ell=1e-3,          # lower bound of “large-ish” singular values in normalized domain
-        small_thresh=1e-2, # what you consider “super close to zero”
-        weight_small=2.0,  # or >1 to emphasize preserving small singular values
+        # small_thresh=1e-2, # what you consider “super close to zero”
+        small_thresh=1e-4, # what you consider “super close to zero”
+        # weight_small=2.0,  # or >1 to emphasize preserving small singular values
+        weight_small=0.0,  # or >1 to emphasize preserving small singular values
         n_steps=2000,
         lr=1e-3,
         device="cuda"  # or "cpu"
-    )
-
+    )"""
     """
     coeffs = build_polar_express_coeffs_with_small_preservation(
         num_iters=num_iters,
@@ -264,6 +265,14 @@ if __name__ == "__main__":
     )
     """
     # coeffs = polar_express_coeffs
+
+    coeffs = optimal_composition(
+        l=1e-3,
+        num_iters=num_iters,
+        cushion=cushion,
+        safety_factor=safety_factor,
+    )
+
 
     print("Refined Polar Express coefficients:")
     for c in coeffs:

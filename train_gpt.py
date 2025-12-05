@@ -373,6 +373,30 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
 ]
 
+#polar_express_coeffs = [
+#    (7.042591168351887, -19.546957500198477, 14.232214398877026),
+#    (2.797801873285498, -2.1057054132897735, 0.4796317955107122),
+#    (1.9725416536693654, -1.3424651687719673, 0.375275769476454),
+#]
+
+# polar_express_coeffs = [
+# (7.766098030895411, -18.31916068361542, 12.755833593270749),
+# (1.330580039460307, -0.3944684473412044, 0.046472890697532035),
+# ]
+
+# polar_express_coeffs = [
+#        (7.92136340966523, -20.691978864124195, 14.374512276513785),
+#(3.9291874789337187, -2.586377267626802, 0.4527620330333837),
+#(3.796353271872374, -2.5581829755358965, 0.4584432614121615),
+#(3.3417335008303137, -2.407976574195336, 0.4688322729276523),
+#(2.354621664533628, -1.6567889418546358, 0.3881102118847583),
+#(1.8708613454572025, -1.2122970281948622, 0.3429715001604667),
+#(1.8382759402164648, -1.1779463260799554, 0.339653225944384),
+#(1.8382352508709185, -1.1779028336319382, 0.33964901237089584),
+#(1.838235365057106, -1.177903054243706, 0.3396491189256525),
+#]
+
+
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
 def polar_express(G: torch.Tensor):
     """
@@ -901,6 +925,9 @@ class MLP(nn.Module):
 
     def forward(self, x: Tensor):
         x = F.linear(x, self.c_fc.T.type_as(x))
+        # 2. [NEW] Compete! 
+        # Loud neurons suppress quiet ones via normalization. 
+        # This creates a "Winner-Take-All" dynamic before the non-linearity.
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = F.linear(x, self.c_proj.type_as(x))
         return x
@@ -965,6 +992,7 @@ class GPT(nn.Module):
                 ]
             )
         )
+
         # set learning rates
         for param in self.embed.parameters():
             param.lr_mul = 75.
@@ -972,6 +1000,8 @@ class GPT(nn.Module):
             param.lr_mul = 75.
         self.lm_head.weight.lr_mul = 1.0
         self.scalars.lr_mul = 5.0
+
+
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
         assert input_seq.ndim == 1
@@ -1323,6 +1353,7 @@ optimizer1 = DistAdam(
     weight_decay=0.0,
 )
 optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
+# optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.05, momentum=0.95, beta2=0.95, weight_decay=1.2)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
