@@ -1005,10 +1005,31 @@ class CausalSelfAttention(nn.Module):
                 k_sparse = min(self.dsa_topk, T)
                 topk_scores, topk_indices = torch.topk(indexer_scores, k=k_sparse, dim=-1)
 
-            y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                            causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
-            y = y.view(B, T, self.num_heads, self.head_dim)
+                # Gather top-k K/V per head (shared for all queries in that head)
+                k_src = k.permute(0, 2, 1, 3)  # (B, H, T, D)
+                v_src = v.permute(0, 2, 1, 3)  # (B, H, T, D)
+                gather_idx = topk_indices.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
+                k_sel = torch.take_along_dim(k_src, gather_idx, dim=2)  # (B, H, k, D)
+                v_sel = torch.take_along_dim(v_src, gather_idx, dim=2)  # (B, H, k, D)
+
+                # Compute attention to selected tokens
+                q_heads = q.permute(0, 2, 1, 3)  # (B, H, T, D)
+                scores = torch.einsum('bhtd,bhkd->bhtk', q_heads, k_sel) * attn_scale
+
+                # Causal mask relative to selected indices
+                arange_t = torch.arange(T, device=x.device).view(1, 1, T, 1)
+                causal_mask_sel = topk_indices.unsqueeze(2) > arange_t  # (B, H, T, k)
+                scores = scores.masked_fill(causal_mask_sel, float('-inf'))
+
+                attn_prob = torch.softmax(scores, dim=-1)
+                y_heads = torch.einsum('bhtk,bhkd->bhtd', attn_prob, v_sel)
+                y = y_heads.permute(0, 2, 1, 3).contiguous()  # (B, T, H, D)
+            else:
+                y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                                max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                                causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
+                y = y.view(B, T, self.num_heads, self.head_dim)
+
             y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
             y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
             y = F.linear(y, self.o_w.type_as(y))
@@ -1373,6 +1394,11 @@ class Hyperparameters:
     mla_kv_dim: int = 256  # latent KV dim for MLA/DSA
     mla_rope_dim: int = 64  # decoupled RoPE dim for MLA/DSA
     dsa_topk: int = 512  # top-k tokens for sparse attention
+    # Efficiency intuition:
+    # - MHA baseline cost ~O(num_heads * T * head_dim) memory and ~O(num_heads * T^2) flops.
+    # - GQA reduces K/V heads from num_heads -> num_kv_heads: memory/compute for K/V scales by (num_kv_heads / num_heads).
+    # - MLA compresses K/V to mla_kv_dim instead of head_dim: cost roughly scales by (mla_kv_dim / head_dim) for K/V, with Q kept at head_dim.
+    # - DSA further limits attention to dsa_topk tokens per query: effective T in the softmax becomes dsa_topk instead of full T (in this file we gather top-k K/V before attention).
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
