@@ -409,7 +409,6 @@ def polar_express(G: torch.Tensor):
 # Muon optimizer
 
 class NorMuon(torch.optim.Optimizer):
-    # Added beta3 (slow momentum) and alpha_mix (mix strength)
     def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, beta2=0.95, 
                  beta3=0.9995, alpha_mix=4.0, custom_sizing=True):
         defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2, 
@@ -421,28 +420,36 @@ class NorMuon(torch.optim.Optimizer):
             param_groups = self.generate_standard_param_groups(params)
         super().__init__(param_groups, defaults)
 
-    # ... [Keep reset(), generate_standard_param_groups(), generate_custom_param_groups() unchanged] ...
+    def generate_standard_param_groups(self, params):
+        groups = defaultdict(list)
+        for param in params:
+            groups[param.label].append(param)
+        param_groups = []
+        for module_name, group_params in groups.items():
+            chunk_size = (len(group_params) + self.world_size - 1) // self.world_size
+            param_groups.append(dict(params=group_params, chunk_size=chunk_size))
+        return param_groups
 
-    # Helper to swap standard weights with the averaged weights (for validation)
-    @torch.no_grad()
-    def swap_to_averaged(self):
-        for group in self.param_groups:
-            if "weight_avg" not in group: continue
-            params = group["params"]
-            avg = group["weight_avg"]
-            # We need to unstack the avg buffer to match params structure
-            # This is complex due to the distributed sharding. 
-            # EASIER STRATEGY: We just return the attribute and handle it in main loop if needed.
-            # But for simplicity in this script, we will just rely on the fact that 
-            # AdEMAMix improves the TRAINING trajectory itself.
-            pass
+    def generate_custom_param_groups(self, params):
+        module_group_order = ['smear_gate', 'attn_gate', 'attn', 'mlp']
+        params_list = list(params)
+        params_list.sort(key=lambda x: module_group_order.index(x.label))
+        idx = 0
+        group_sizes = [1, 10, 16, 16]
+        assert len(params_list) == sum(group_sizes)
+        param_groups = []
+        for size in group_sizes:
+            chunk_size = (size + self.world_size - 1) // self.world_size
+            group_params = params_list[idx: idx + size]
+            param_groups.append(dict(params=group_params, chunk_size=chunk_size))
+            idx += size
+        return param_groups
 
     @torch.no_grad()
     def step(self, use_ademamix=False):
         rank = dist.get_rank()
         group_infos = []
-        # ... [Keep the first ReduceScatter pass unchanged] ...
-        # (Copy lines 566-599 from your original script)
+        # 1. Reduce Scatter (Collect grads from all GPUs)
         for group in self.param_groups:
             params: list[Tensor] = group["params"]
             if not params: continue
@@ -458,72 +465,68 @@ class NorMuon(torch.optim.Optimizer):
             group_infos.append(dict(grad_chunk=grad_chunk, reduce_future=reduce_future))
 
         all_gather_infos = []
+        # 2. Update Local Shard
         for group, info in zip(self.param_groups, group_infos):
             info["reduce_future"].wait()
             params = group["params"]
             grad_chunk = info["grad_chunk"]
             chunk_size = group["chunk_size"]
             
-            # ... [Keep setup logic lines 603-613] ...
             start_idx = rank * chunk_size
             module_idx = start_idx if start_idx < len(params) else 0
             num_params = min(chunk_size, max(0, len(params) - start_idx))
             
-            # --- MODIFIED MOMENTUM LOGIC START ---
             if "momentum_buffer" not in group:
                 group["momentum_buffer"] = torch.zeros_like(grad_chunk[:num_params])
             momentum_buffer = group["momentum_buffer"]
             
-            # 1. Fast Momentum (Beta1 ~0.95)
+            # --- 1. Fast Momentum (Beta1 ~0.95) ---
             momentum_buffer.lerp_(grad_chunk[:num_params], 1 - group["momentum"])
             
             if use_ademamix:
-                # 2. Slow Momentum (Beta3 ~0.9999) - "Deep Memory"
+                # --- 2. Slow Momentum (Beta3 ~0.9999) ---
                 if "slow_momentum_buffer" not in group:
                     group["slow_momentum_buffer"] = torch.zeros_like(grad_chunk[:num_params])
                 slow_buffer = group["slow_momentum_buffer"]
                 slow_buffer.lerp_(grad_chunk[:num_params], 1 - group["beta3"])
                 
-                # 3. AdEMAMix: Combine Fast + Alpha * Slow
-                # We essentially trick Muon into orthogonalizing the MIXED direction
-                # instead of just the fast momentum direction.
+                # --- 3. Mix: Fast + Alpha * Slow ---
+                # This "Proxy Gradient" contains the deep memory of the optimization
                 proxy_grad = momentum_buffer + group["alpha_mix"] * slow_buffer
                 updated_grads = proxy_grad
             else:
-                # Standard Muon behavior
                 updated_grads = momentum_buffer
 
-            # --- MODIFIED MOMENTUM LOGIC END ---
-
-            # ... [Keep reshaping logic lines 618-623] ...
+            # Reshaping Logic
             grad_shape = updated_grads.shape
             if params[module_idx].label == 'attn':
                 for p in params[module_idx:module_idx + num_params]: assert p.label == 'attn'
                 updated_grads = updated_grads.view(4 * grad_shape[0], grad_shape[1], grad_shape[2] // 4)
-            # Add the MLP Grouped Logic here if you kept it from previous step
+            # [Grouped MLP] Split (D, 4D) -> 4x (D, D) for better superposition
             elif params[module_idx].label == 'mlp':
+                 for p in params[module_idx:module_idx + num_params]: assert p.label == 'mlp'
                  updated_grads = updated_grads.view(4 * grad_shape[0], grad_shape[1], grad_shape[2] // 4)
 
             ref_param = params[module_idx]
             param_shape = ref_param.shape
 
-            # ... [Keep Second Momentum / RMSNorm / Param_LR logic lines 625-645] ...
+            # Second Momentum (RMSNorm of update)
             if "second_momentum_buffer" not in group:
                 group["second_momentum_buffer"] = (torch.zeros_like(updated_grads[..., :, :1]) if param_shape[-2] >= param_shape[-1] else torch.zeros_like(updated_grads[..., :1, :]))
             second_momentum_buffer = group["second_momentum_buffer"]
 
             if "param_lr" not in group:
                  group["param_lr"] = (max(1., param_shape[-2] / param_shape[-1]) ** 0.5 * ref_param.new_tensor([getattr(param, "lr_mul", 1.0) for param in params[module_idx:module_idx + num_params]]).view(-1, 1, 1))
-                 group["param_wd"] = ref_param.new_tensor([getattr(param, "wd_mul", 1.0) for param in params[module_idx:module_idx + num_params]]).view(-1, 1, 1)
+                 group["param_wd"] = ref_param.new_tensor([getattr(param, "wd_mul", 1.0) for param in params[module_idx:module_idx + num_params]]).view(-1, 1, 1))
 
             eff_lr = group["lr"] * group["param_lr"]
             eff_wd = group["lr"] * group["weight_decay"] * group["param_wd"]
 
-            # Polar Express (Use 3-step coefficients for speed)
+            # Newton-Schulz / Polar Express
             if num_params == 0: v_chunk = updated_grads
-            else: v_chunk = polar_express(updated_grads)
+            else: v_chunk = polar_express(updated_grads) # Uses the global coeffs
 
-            # ... [Keep Scaling/Update logic lines 654-666] ...
+            # Scale to spectral radius 1
             v_norm = v_chunk.norm(dim=(-2, -1), keepdim=True)
             v_mean = v_chunk.square().mean(dim=-1 if param_shape[-2] >= param_shape[-1] else -2, keepdim=True)
             second_momentum_buffer.lerp_(v_mean.to(dtype=ref_param.dtype), 1 - group["beta2"])
@@ -536,25 +539,16 @@ class NorMuon(torch.optim.Optimizer):
             updated_params = torch.empty_like(grad_chunk)
             param_chunk = torch.stack(params[module_idx:module_idx + num_params]) if num_params > 0 else torch.zeros_like(v_chunk)
             
+            # Cautious Weight Decay
             mask = (v_chunk * param_chunk) >= 0
             v_chunk.addcmul_(param_chunk, (eff_wd * mask).to(ref_param.dtype))
             param_chunk.addcmul_(v_chunk, -eff_lr)
-
-            # --- SCHEDULE FREE / WEIGHT AVERAGING (Optional) ---
-            # If AdEMAMix is on, we are in the "fine-tuning" phase.
-            # We can start accumulating a Polyak average for the final model.
-            if use_ademamix:
-                if "weight_avg" not in group:
-                     group["weight_avg"] = param_chunk.clone()
-                # Simple EMA (1/t decay equivalent): lerp(new, 0.001)
-                # In strict schedule-free this is 1/t, here we use a small constant for stability
-                group["weight_avg"].lerp_(param_chunk, 0.005) 
 
             updated_params[:num_params].copy_(param_chunk)
             if num_params < chunk_size:
                 updated_params[num_params:].zero_()
 
-            # ... [Keep All-Gather logic] ...
+            # 3. All Gather (Distribute results back)
             stacked_params = torch.empty((padded_num_params, *param_shape), dtype=updated_params.dtype, device=updated_params.device)
             gather_future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True).get_future()
             all_gather_infos.append({"gather_future": gather_future, "stacked_params": stacked_params, "orig_params": params})
