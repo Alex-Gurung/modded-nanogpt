@@ -1862,6 +1862,12 @@ for step in range(train_steps + 1):
     # --------------- OPTIMIZER SWITCHING -----------------
     if args.switch_optimizer_at_step == step:
         print0(f"Switching optimizer from {args.scalar_optimizer} to {args.switch_to_optimizer} at step {step}", console=True)
+        # Remove old backward hooks from previous optimizers
+        for opt in optimizers:
+            if hasattr(opt, '_reduce_scatter_hooks'):
+                for hook in opt._reduce_scatter_hooks:
+                    hook.remove()
+                opt._reduce_scatter_hooks.clear()
         # Create new optimizers
         optimizers = create_optimizers(args.switch_to_optimizer)
         for opt in optimizers:
