@@ -1367,6 +1367,7 @@ def get_lr(step: int):
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
         lr = w * 1.0 + (1 - w) * 0.1
+
     return lr
 
 def get_ws(step: int):
