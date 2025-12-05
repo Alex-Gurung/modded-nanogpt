@@ -1803,7 +1803,7 @@ class Hyperparameters:
     adaptive_depth_threshold: float = 0.5  # Confidence threshold for early exit (higher = exit earlier)
     # attention architecture options
     # attn_mode: str = "mha"  # "mha" (multi-head), "gqa" (grouped-query), "mla" (multi-head latent), "dsa" (deepseek sparse)
-    attn_mode: str = "gqa"  # "mha" (multi-head), "gqa" (grouped-query), "mla" (multi-head latent), "dsa" (deepseek sparse)
+    attn_mode: str = "dsa"  # "mha" (multi-head), "gqa" (grouped-query), "mla" (multi-head latent), "dsa" (deepseek sparse)
     num_kv_heads: int = 2  # number of KV heads for GQA (only used if attn_mode == "gqa")
     mla_kv_dim: int = 256  # latent KV dimension for MLA (only used if attn_mode == "mla")
     mla_rope_dim: int = 64  # decoupled RoPE dimension for MLA (default 64)
