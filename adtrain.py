@@ -421,19 +421,30 @@ class NorMuon(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
 
     def generate_standard_param_groups(self, params):
+        """
+        Use this method if running on less than 8 GPU or experimenting with additional attn or mlp modules.
+        Creates one param group per module.
+        """
         groups = defaultdict(list)
         for param in params:
             groups[param.label].append(param)
+
         param_groups = []
         for module_name, group_params in groups.items():
             chunk_size = (len(group_params) + self.world_size - 1) // self.world_size
             param_groups.append(dict(params=group_params, chunk_size=chunk_size))
+
         return param_groups
 
     def generate_custom_param_groups(self, params):
+        """
+        Implementation requires that a single GPU does not receive both attn
+        and mlp params when a param group is split across GPUs.
+        """
         module_group_order = ['smear_gate', 'attn_gate', 'attn', 'mlp']
         params_list = list(params)
         params_list.sort(key=lambda x: module_group_order.index(x.label))
+
         idx = 0
         group_sizes = [1, 10, 16, 16]
         assert len(params_list) == sum(group_sizes)
@@ -443,6 +454,7 @@ class NorMuon(torch.optim.Optimizer):
             group_params = params_list[idx: idx + size]
             param_groups.append(dict(params=group_params, chunk_size=chunk_size))
             idx += size
+
         return param_groups
 
     @torch.no_grad()
