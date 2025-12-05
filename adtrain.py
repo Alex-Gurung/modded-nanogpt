@@ -514,7 +514,7 @@ class NorMuon(torch.optim.Optimizer):
 
             if "param_lr" not in group:
                  group["param_lr"] = (max(1., param_shape[-2] / param_shape[-1]) ** 0.5 * ref_param.new_tensor([getattr(param, "lr_mul", 1.0) for param in params[module_idx:module_idx + num_params]]).view(-1, 1, 1))
-                 group["param_wd"] = ref_param.new_tensor([getattr(param, "wd_mul", 1.0) for param in params[module_idx:module_idx + num_params]]).view(-1, 1, 1))
+                 group["param_wd"] = ref_param.new_tensor([getattr(param, "wd_mul", 1.0) for param in params[module_idx:module_idx + num_params]]).view(-1, 1, 1)
 
             eff_lr = group["lr"] * group["param_lr"]
             eff_wd = group["lr"] * group["weight_decay"] * group["param_wd"]
