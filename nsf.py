@@ -748,22 +748,20 @@ class NorMuonEMA(NorMuon):
         super().__init__(params, *args, **kwargs)
         self.ema_decay = float(ema_decay)
         self.ema_warmup_steps = int(ema_warmup_steps)
-        self._ema_initialized = False
         self._global_step = 0
+        self._init_ema_if_needed()
 
     @torch.no_grad()
     def _init_ema_if_needed(self):
-        if self._ema_initialized:
-            return
-        # Attach an 'ema' tensor to the state of each parameter NorMuon manages.
+        # (Re)attach an 'ema' tensor to every parameter state; safe to call repeatedly.
         for group in self.param_groups:
             for p in group["params"]:
                 if p is None or not p.requires_grad:
                     continue
-                state = self.state[p]
-                # clone current weights as EMA starting point
-                state["ema"] = p.detach().clone()
-        self._ema_initialized = True
+                state = self.state.setdefault(p, {})
+                if "ema" not in state:
+                    # clone current weights as EMA starting point
+                    state["ema"] = p.detach().clone()
 
     @torch.no_grad()
     def _update_ema(self):
@@ -787,7 +785,7 @@ class NorMuonEMA(NorMuon):
             for p in group["params"]:
                 if p is None or not p.requires_grad:
                     continue
-                state = self.state[p]
+                state = self.state.setdefault(p, {})
                 if "ema" not in state:
                     state["ema"] = p.detach().clone()
                 ema = state["ema"]
@@ -815,7 +813,7 @@ class NorMuonEMA(NorMuon):
             for p in group["params"]:
                 if p is None or not p.requires_grad:
                     continue
-                state = self.state[p]
+                state = self.state.setdefault(p, {})
                 if "ema" not in state:
                     state["ema"] = p.detach().clone()
                 ema = state["ema"]
