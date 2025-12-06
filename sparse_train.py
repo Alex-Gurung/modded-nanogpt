@@ -1389,7 +1389,7 @@ class Hyperparameters:
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # attention architecture options
-    attn_mode: str = "gqa"  # "mha", "gqa", "mla", or "dsa"
+    attn_mode: str = "dsa"  # "mha", "gqa", "mla", or "dsa"
     num_kv_heads: int = 2  # KV heads for GQA
     mla_kv_dim: int = 256  # latent KV dim for MLA/DSA
     mla_rope_dim: int = 64  # decoupled RoPE dim for MLA/DSA
