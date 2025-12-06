@@ -1013,6 +1013,9 @@ class CausalSelfAttention(nn.Module):
                 indexer_scores = indexer_scores.masked_fill(causal_mask.view(1, 1, T, T), float('-inf'))
 
                 k_sparse = min(self.dsa_topk, T)
+                # cap effective top-k to keep memory manageable on long sequences
+                k_sparse = min(k_sparse, 128)
+
                 if k_sparse >= T:
                     y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                                     max_seqlen_q=max_len, max_seqlen_k=max_len,
