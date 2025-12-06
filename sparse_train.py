@@ -992,7 +992,8 @@ class CausalSelfAttention(nn.Module):
             assert rope_cos.size(-1) == rope_dim, f"YaRN rope dims must cover MLA rope size: got {rope_cos.size(-1)}, need {rope_dim}"
             q_rope_latent = F.linear(c_q, self.q_rope.type_as(c_q)).view(B, T, self.num_heads, self.mla_rope_dim)
             q_rope_latent = rotary(q_rope_latent, rope_cos, rope_sin)
-            q_rope_proj = F.linear(q_rope_latent.view(B, T, -1), self.q_rope_out.type_as(c_q)).view(B, T, self.num_heads, self.head_dim)
+            # Flatten last two dims for linear projection, then reshape back
+            q_rope_proj = F.linear(q_rope_latent.view(B, T, self.num_heads * self.mla_rope_dim), self.q_rope_out.type_as(c_q)).view(B, T, self.num_heads, self.head_dim)
             q = q_nope + q_rope_proj
 
             # K: NoPE component (from compressed latent space)
@@ -1014,22 +1015,18 @@ class CausalSelfAttention(nn.Module):
                 v = sa_lambdas[0] * v
 
             # Compute attention
-            if self.attn_mode == "dsa":
-                y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                                max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                                causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
-                y = y.view(B, T, self.num_heads, self.head_dim)
-            else:
-                y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                                max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                                causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
-                y = y.view(B, T, self.num_heads, self.head_dim)
+            y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                            causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
+            y = y.view(B, T, self.num_heads, self.head_dim)
 
-            # Output projection: o_mla (hdim -> hdim), then gate, then o_w (hdim -> dim)
-            y = y.contiguous().view(B, T, self.hdim)
-            y = F.linear(y, self.o_mla.type_as(y)).view(B, T, self.num_heads, self.head_dim)
+            # Apply attention gate
             y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
-            y = y.contiguous().view(B, T, self.hdim)
+
+            # Output projection: o_mla (hdim -> hdim) then o_w (hdim -> dim)
+            # Combine into single efficient projection by flattening once
+            y = y.view(B, T, self.hdim)
+            y = F.linear(y, self.o_mla.type_as(y))
             y = F.linear(y, self.o_w.type_as(y))
 
         return y
@@ -1387,7 +1384,7 @@ class Hyperparameters:
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
     # attention architecture options
-    attn_mode: str = "dsa"  # "mha", "gqa", "mla", or "dsa"
+    attn_mode: str = "mla"  # "mha", "gqa", "mla", or "dsa"
     num_kv_heads: int = 2  # KV heads for GQA
     mla_kv_dim: int = 256  # latent KV dim for MLA/DSA
     mla_rope_dim: int = 64  # decoupled RoPE dim for MLA/DSA
