@@ -1500,8 +1500,8 @@ optimizer2 = NorMuon(
     weight_decay=1.2,
     momentum=0.95,
     beta2=0.95,
-    nsf_cycle_steps=2048,  # as defined above
-    nsf_warmup_steps=256,  # behave like vanilla NorMuon for first ~256 steps
+    nsf_cycle_steps=512,  # as defined above
+    nsf_warmup_steps=100,  # behave like vanilla NorMuon for first ~256 steps
     # You can also override exponents/phase fractions here if desired:
     # nsf_exponents=(0.6, 0.3, 0.0, -0.2),
     # nsf_phase_fractions=(0.5, 0.8, 0.95, 1.0),

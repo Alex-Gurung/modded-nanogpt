@@ -1,3 +1,4 @@
+loss_plots/*
 logs/**/*
 logs/*
 *.txt
