@@ -1040,7 +1040,8 @@ class CausalSelfAttention(nn.Module):
                         scores = scores.masked_fill(causal_mask_sel, float('-inf'))
 
                         attn_prob = torch.softmax(scores, dim=-1)
-                        y_h = torch.einsum('btk,btkd->btd', attn_prob, v_sel)
+                        attn_prob = attn_prob.unsqueeze(-1)  # (B,T,k,1)
+                        y_h = (attn_prob * v_sel).sum(dim=2)
                         y_heads[:, h] = y_h
 
                     y = y_heads.permute(0, 2, 1, 3).contiguous()
