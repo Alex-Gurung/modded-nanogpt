@@ -881,29 +881,39 @@ class CausalSelfAttention(nn.Module):
             self.q_down = nn.Parameter(torch.empty(mla_kv_dim, self.dim))
             self.q_up_nope = nn.Parameter(torch.empty(self.hdim, mla_kv_dim))
             self.q_rope = nn.Parameter(torch.empty(num_heads * mla_rope_dim, mla_kv_dim))
+            self.q_rope_out = nn.Parameter(torch.empty(self.hdim, num_heads * mla_rope_dim))
             self.kv_down = nn.Parameter(torch.empty(mla_kv_dim * 2, self.dim))
             self.k_rope = nn.Parameter(torch.empty(mla_rope_dim, self.dim))
+            self.k_rope_out = nn.Parameter(torch.empty(self.num_heads * self.head_dim, mla_rope_dim))
+            self.k_up = nn.Parameter(torch.empty(self.num_heads * self.head_dim, mla_kv_dim))
+            self.v_up = nn.Parameter(torch.empty(self.num_heads * self.head_dim, mla_kv_dim))
             self.o_w = nn.Parameter(torch.empty(self.hdim, self.dim))
+            self.o_mla = nn.Parameter(torch.empty(self.hdim, self.num_heads * mla_kv_dim))
 
-            for p in [self.q_down, self.q_up_nope, self.q_rope, self.kv_down, self.k_rope, self.o_w]:
+            for p in [self.q_down, self.q_up_nope, self.q_rope, self.q_rope_out, self.kv_down, self.k_rope, self.k_rope_out, self.k_up, self.v_up, self.o_w, self.o_mla]:
                 p.label = 'attn'
 
             with torch.no_grad():
                 self.q_down.uniform_(-bound, bound)
                 self.q_up_nope.uniform_(-bound, bound)
                 self.q_rope.uniform_(-bound, bound)
+                self.q_rope_out.uniform_(-bound, bound)
                 self.kv_down.uniform_(-bound, bound)
                 self.k_rope.uniform_(-bound, bound)
+                self.k_rope_out.uniform_(-bound, bound)
+                self.k_up.uniform_(-bound, bound)
+                self.v_up.uniform_(-bound, bound)
                 self.o_w.zero_()
+                self.o_mla.zero_()
 
             if attn_mode == "dsa":
-                self.indexer_q = nn.Parameter(torch.empty(num_heads, mla_kv_dim))
-                self.indexer_k = nn.Parameter(torch.empty(mla_kv_dim, self.dim))
-                self.indexer_q.label = 'attn'
-                self.indexer_k.label = 'attn'
+                self.indexer_q_w = nn.Parameter(torch.empty(num_heads * mla_kv_dim, self.dim))
+                self.indexer_k_w = nn.Parameter(torch.empty(num_heads * mla_kv_dim, self.dim))
+                self.indexer_q_w.label = 'attn'
+                self.indexer_k_w.label = 'attn'
                 with torch.no_grad():
-                    self.indexer_q.uniform_(-bound, bound)
-                    self.indexer_k.uniform_(-bound, bound)
+                    self.indexer_q_w.uniform_(-bound, bound)
+                    self.indexer_k_w.uniform_(-bound, bound)
         else:
             raise ValueError(f"Unknown attn_mode: {attn_mode}")
 
@@ -977,59 +987,57 @@ class CausalSelfAttention(nn.Module):
             assert rope_cos.size(-1) == rope_dim, "YaRN rope dims must cover MLA rope size"
             q_rope_latent = F.linear(c_q, self.q_rope.type_as(c_q)).view(B, T, self.num_heads, self.mla_rope_dim)
             q_rope_latent = rotary(q_rope_latent, rope_cos, rope_sin)
-
-            q = q_nope
+            q_rope_proj = F.linear(q_rope_latent.view(B, T, -1), self.q_rope_out.type_as(c_q)).view(B, T, self.num_heads, self.head_dim)
+            q = q_nope + q_rope_proj
 
             k_rope = F.linear(x, self.k_rope.type_as(x))
             k_rope = rotary(k_rope.unsqueeze(2), rope_cos, rope_sin).squeeze(2)
+            k_rope_proj = F.linear(k_rope, self.k_rope_out.type_as(k_rope)).view(B, T, self.num_heads, self.head_dim)
 
-            k_nope = c_k_nope.unsqueeze(2).expand(B, T, self.num_heads, self.mla_kv_dim)[..., :self.head_dim]
-            k = k_nope
+            k_nope = F.linear(c_k_nope, self.k_up.type_as(x)).view(B, T, self.num_heads, self.head_dim)
+            k = k_nope + k_rope_proj
 
-            v = c_v.unsqueeze(2).expand(B, T, self.num_heads, self.mla_kv_dim)[..., :self.head_dim]
+            v = F.linear(c_v, self.v_up.type_as(x)).view(B, T, self.num_heads, self.head_dim)
 
             if ve is not None:
-                v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v)
+                v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view(B, T, self.num_heads, self.head_dim).expand_as(v)
             else:
                 v = sa_lambdas[0] * v
 
             if self.attn_mode == "dsa":
-                indexer_k = F.linear(x, self.indexer_k.type_as(x))
-                indexer_scores = torch.einsum('hd,btd->bht', self.indexer_q.type_as(indexer_k), indexer_k)
+                indexer_q = F.linear(x, self.indexer_q_w.type_as(x)).view(B, T, self.num_heads, self.mla_kv_dim)
+                indexer_k = F.linear(x, self.indexer_k_w.type_as(x)).view(B, T, self.num_heads, self.mla_kv_dim)
+                indexer_scores = torch.einsum('bthd,bshd->bhts', indexer_q, indexer_k)
 
                 causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
-                causal_mask = causal_mask.view(1, 1, T, T)
-                indexer_scores = indexer_scores.unsqueeze(-2)
-                indexer_scores = indexer_scores.masked_fill(causal_mask, float('-inf')).squeeze(-2)
+                indexer_scores = indexer_scores.masked_fill(causal_mask.view(1, 1, T, T), float('-inf'))
 
                 k_sparse = min(self.dsa_topk, T)
                 topk_scores, topk_indices = torch.topk(indexer_scores, k=k_sparse, dim=-1)
 
-                # Gather top-k K/V per head (shared for all queries in that head)
-                k_src = k.permute(0, 2, 1, 3)  # (B, H, T, D)
-                v_src = v.permute(0, 2, 1, 3)  # (B, H, T, D)
-                gather_idx = topk_indices.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-                k_sel = torch.take_along_dim(k_src, gather_idx, dim=2)  # (B, H, k, D)
-                v_sel = torch.take_along_dim(v_src, gather_idx, dim=2)  # (B, H, k, D)
+                k_heads = k.permute(0, 2, 1, 3)  # (B, H, T, D)
+                v_heads = v.permute(0, 2, 1, 3)
+                gather_idx = topk_indices.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim)  # (B,H,T,k,D)
+                k_sel = torch.gather(k_heads.unsqueeze(2).expand(-1, -1, T, -1, -1), 3, gather_idx)
+                v_sel = torch.gather(v_heads.unsqueeze(2).expand(-1, -1, T, -1, -1), 3, gather_idx)
 
-                # Compute attention to selected tokens
-                q_heads = q.permute(0, 2, 1, 3)  # (B, H, T, D)
-                scores = torch.einsum('bhtd,bhkd->bhtk', q_heads, k_sel) * attn_scale
+                q_heads = q.permute(0, 2, 1, 3)  # (B,H,T,D)
+                scores = (q_heads.unsqueeze(3) * k_sel).sum(dim=-1) * attn_scale  # (B,H,T,k)
 
-                # Causal mask relative to selected indices
                 arange_t = torch.arange(T, device=x.device).view(1, 1, T, 1)
-                causal_mask_sel = topk_indices.unsqueeze(2) > arange_t  # (B, H, T, k)
+                causal_mask_sel = topk_indices > arange_t
                 scores = scores.masked_fill(causal_mask_sel, float('-inf'))
 
                 attn_prob = torch.softmax(scores, dim=-1)
-                y_heads = torch.einsum('bhtk,bhkd->bhtd', attn_prob, v_sel)
-                y = y_heads.permute(0, 2, 1, 3).contiguous()  # (B, T, H, D)
+                y_heads = torch.einsum('bhtk,bhtkd->bhtd', attn_prob, v_sel)
+                y = y_heads.permute(0, 2, 1, 3).contiguous()
             else:
                 y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                                 max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                                 causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
                 y = y.view(B, T, self.num_heads, self.head_dim)
 
+            y = F.linear(y.view(B, T, -1), self.o_mla.type_as(y)).view(B, T, self.num_heads, self.head_dim)
             y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
             y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
             y = F.linear(y, self.o_w.type_as(y))
