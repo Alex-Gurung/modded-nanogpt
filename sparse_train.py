@@ -974,90 +974,62 @@ class CausalSelfAttention(nn.Module):
             y = F.linear(y, self.o_w.type_as(y))
 
         elif self.attn_mode in ["mla", "dsa"]:
-            c_q = F.linear(x, self.q_down.type_as(x))
-            c_kv = F.linear(x, self.kv_down.type_as(x))
-            c_k_nope, c_v = c_kv.chunk(2, dim=-1)
+            # Compress to latent space
+            c_q = F.linear(x, self.q_down.type_as(x))  # (B, T, mla_kv_dim)
+            c_kv = F.linear(x, self.kv_down.type_as(x))  # (B, T, mla_kv_dim * 2)
+            c_k_nope, c_v = c_kv.chunk(2, dim=-1)  # each (B, T, mla_kv_dim)
 
+            # Normalize compressed representations
             c_q, c_k_nope = norm(c_q), norm(c_k_nope)
 
+            # Q: NoPE component (non-positional)
             q_nope = F.linear(c_q, self.q_up_nope.type_as(c_q)).view(B, T, self.num_heads, self.head_dim)
 
+            # Q: RoPE component (positional, decoupled)
+            # rotary function chunks by 2, so input needs mla_rope_dim and cos/sin need mla_rope_dim // 2
             rope_dim = self.mla_rope_dim // 2
             rope_cos, rope_sin = cos[..., :rope_dim], sin[..., :rope_dim]
-            assert rope_cos.size(-1) == rope_dim, "YaRN rope dims must cover MLA rope size"
+            assert rope_cos.size(-1) == rope_dim, f"YaRN rope dims must cover MLA rope size: got {rope_cos.size(-1)}, need {rope_dim}"
             q_rope_latent = F.linear(c_q, self.q_rope.type_as(c_q)).view(B, T, self.num_heads, self.mla_rope_dim)
             q_rope_latent = rotary(q_rope_latent, rope_cos, rope_sin)
             q_rope_proj = F.linear(q_rope_latent.view(B, T, -1), self.q_rope_out.type_as(c_q)).view(B, T, self.num_heads, self.head_dim)
             q = q_nope + q_rope_proj
 
-            k_rope = F.linear(x, self.k_rope.type_as(x))
-            k_rope = rotary(k_rope.unsqueeze(2), rope_cos, rope_sin).squeeze(2)
-            k_rope_proj = F.linear(k_rope, self.k_rope_out.type_as(k_rope)).view(B, T, self.num_heads, self.head_dim)
-
+            # K: NoPE component (from compressed latent space)
             k_nope = F.linear(c_k_nope, self.k_up.type_as(x)).view(B, T, self.num_heads, self.head_dim)
+
+            # K: RoPE component (positional, decoupled, applied directly to input)
+            k_rope = F.linear(x, self.k_rope.type_as(x))  # (B, T, mla_rope_dim)
+            k_rope = rotary(k_rope.unsqueeze(2), rope_cos, rope_sin).squeeze(2)  # (B, T, mla_rope_dim)
+            k_rope_proj = F.linear(k_rope, self.k_rope_out.type_as(k_rope)).view(B, T, self.num_heads, self.head_dim)
             k = k_nope + k_rope_proj
 
+            # V: up-project from compressed latent space (no positional encoding)
             v = F.linear(c_v, self.v_up.type_as(x)).view(B, T, self.num_heads, self.head_dim)
 
+            # Apply value embeddings if provided
             if ve is not None:
-                v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view(B, T, self.num_heads, self.head_dim).expand_as(v)
+                v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v)
             else:
                 v = sa_lambdas[0] * v
 
+            # Compute attention
             if self.attn_mode == "dsa":
-                indexer_q = F.linear(x, self.indexer_q_w.type_as(x)).view(B, T, self.num_heads, self.mla_kv_dim)
-                indexer_k = F.linear(x, self.indexer_k_w.type_as(x)).view(B, T, self.num_heads, self.mla_kv_dim)
-                indexer_scores = torch.einsum('bthd,bshd->bhts', indexer_q, indexer_k)
-
-                causal_mask = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), diagonal=1)
-                indexer_scores = indexer_scores.masked_fill(causal_mask.view(1, 1, T, T), float('-inf'))
-
-                k_sparse = min(self.dsa_topk, T)
-                # cap effective top-k to keep memory manageable on long sequences
-                k_sparse = min(k_sparse, 128)
-
-                if k_sparse >= T:
-                    y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                                    max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                                    causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
-                    y = y.view(B, T, self.num_heads, self.head_dim)
-                else:
-                    _, topk_indices = torch.topk(indexer_scores, k=k_sparse, dim=-1)
-                    q_heads = q.permute(0, 2, 1, 3)  # (B,H,T,D)
-                    k_heads = k.permute(0, 2, 1, 3)
-                    v_heads = v.permute(0, 2, 1, 3)
-                    y_heads = torch.empty_like(q_heads)
-
-                    arange_t = torch.arange(T, device=x.device, dtype=topk_indices.dtype).view(1, 1, T, 1)
-                    for h in range(self.num_heads):
-                        idx_h = topk_indices[:, h]  # (B,T,k)
-                        gather_idx = idx_h.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)  # (B,T,k,D)
-
-                        k_exp = k_heads[:, h].unsqueeze(2).expand(-1, -1, k_sparse, -1)
-                        v_exp = v_heads[:, h].unsqueeze(2).expand(-1, -1, k_sparse, -1)
-                        k_sel = torch.gather(k_exp, 1, gather_idx)
-                        v_sel = torch.gather(v_exp, 1, gather_idx)
-
-                        scores = (q_heads[:, h].unsqueeze(2) * k_sel).sum(dim=-1) * attn_scale  # (B,T,k)
-                        causal_mask_sel = idx_h > arange_t  # (B,T,k)
-                        scores = scores.masked_fill(causal_mask_sel, float('-inf'))
-
-                        attn_prob = torch.softmax(scores, dim=-1)
-                        attn_prob = attn_prob.unsqueeze(-1)  # (B,T,k,1)
-                        y_h = (attn_prob * v_sel).sum(dim=2)
-                        y_heads[:, h] = y_h
-
-                    y = y_heads.permute(0, 2, 1, 3).contiguous()
+                y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                                max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                                causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
+                y = y.view(B, T, self.num_heads, self.head_dim)
             else:
                 y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                                 max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                                 causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
                 y = y.view(B, T, self.num_heads, self.head_dim)
 
+            # Output projection: o_mla (hdim -> hdim), then gate, then o_w (hdim -> dim)
             y = y.contiguous().view(B, T, self.hdim)
             y = F.linear(y, self.o_mla.type_as(y)).view(B, T, self.num_heads, self.head_dim)
             y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
-            y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
+            y = y.contiguous().view(B, T, self.hdim)
             y = F.linear(y, self.o_w.type_as(y))
 
         return y
