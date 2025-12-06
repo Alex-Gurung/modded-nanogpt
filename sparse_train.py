@@ -888,7 +888,7 @@ class CausalSelfAttention(nn.Module):
             self.k_up = nn.Parameter(torch.empty(self.num_heads * self.head_dim, mla_kv_dim))
             self.v_up = nn.Parameter(torch.empty(self.num_heads * self.head_dim, mla_kv_dim))
             self.o_w = nn.Parameter(torch.empty(self.hdim, self.dim))
-            self.o_mla = nn.Parameter(torch.empty(self.hdim, self.num_heads * mla_kv_dim))
+            self.o_mla = nn.Parameter(torch.empty(self.hdim, self.hdim))
 
             for p in [self.q_down, self.q_up_nope, self.q_rope, self.q_rope_out, self.kv_down, self.k_rope, self.k_rope_out, self.k_up, self.v_up, self.o_w, self.o_mla]:
                 p.label = 'attn'
@@ -1017,7 +1017,7 @@ class CausalSelfAttention(nn.Module):
 
                 k_heads = k.permute(0, 2, 1, 3)  # (B, H, T, D)
                 v_heads = v.permute(0, 2, 1, 3)
-                gather_idx = topk_indices.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim)  # (B,H,T,k,D)
+                gather_idx = topk_indices.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim)
                 k_sel = torch.gather(k_heads.unsqueeze(2).expand(-1, -1, T, -1, -1), 3, gather_idx)
                 v_sel = torch.gather(v_heads.unsqueeze(2).expand(-1, -1, T, -1, -1), 3, gather_idx)
 
@@ -1037,7 +1037,8 @@ class CausalSelfAttention(nn.Module):
                                                                 causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
                 y = y.view(B, T, self.num_heads, self.head_dim)
 
-            y = F.linear(y.view(B, T, -1), self.o_mla.type_as(y)).view(B, T, self.num_heads, self.head_dim)
+            y = y.contiguous().view(B, T, self.hdim)
+            y = F.linear(y, self.o_mla.type_as(y)).view(B, T, self.num_heads, self.head_dim)
             y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
             y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
             y = F.linear(y, self.o_w.type_as(y))
