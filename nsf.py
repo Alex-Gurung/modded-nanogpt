@@ -365,19 +365,37 @@ def ba_plus_cAA(A: torch.Tensor, alpha: float, beta: float, out: torch.Tensor):
     return out
 
 # Computed for num_iters=5, safety_factor=2e-2, cushion=2
+polar_express_coeffs = [
+    (8.156554524902461, -22.48329292557795, 15.878769915207462),
+    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
+    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
+    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
+    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+]
+
 #polar_express_coeffs = [
-#    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-#    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-#    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-#    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-#    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323)
+#    (7.042591168351887, -19.546957500198477, 14.232214398877026),
+#    (2.797801873285498, -2.1057054132897735, 0.4796317955107122),
+#    (1.9725416536693654, -1.3424651687719673, 0.375275769476454),
 #]
 
-polar_express_coeffs = [
-    (7.042591168351887, -19.546957500198477, 14.232214398877026),
-    (2.797801873285498, -2.1057054132897735, 0.4796317955107122),
-    (1.9725416536693654, -1.3424651687719673, 0.375275769476454),
-]
+# polar_express_coeffs = [
+# (7.766098030895411, -18.31916068361542, 12.755833593270749),
+# (1.330580039460307, -0.3944684473412044, 0.046472890697532035),
+# ]
+
+# polar_express_coeffs = [
+#        (7.92136340966523, -20.691978864124195, 14.374512276513785),
+#(3.9291874789337187, -2.586377267626802, 0.4527620330333837),
+#(3.796353271872374, -2.5581829755358965, 0.4584432614121615),
+#(3.3417335008303137, -2.407976574195336, 0.4688322729276523),
+#(2.354621664533628, -1.6567889418546358, 0.3881102118847583),
+#(1.8708613454572025, -1.2122970281948622, 0.3429715001604667),
+#(1.8382759402164648, -1.1779463260799554, 0.339653225944384),
+#(1.8382352508709185, -1.1779028336319382, 0.33964901237089584),
+#(1.838235365057106, -1.177903054243706, 0.3396491189256525),
+#]
+
 
 @torch.compile(dynamic=False, fullgraph=True) # Must use dynamic=False or else it's much slower
 def polar_express(G: torch.Tensor):
@@ -413,6 +431,56 @@ def polar_express(G: torch.Tensor):
 
 # -----------------------------------------------------------------------------
 # Muon optimizer
+
+
+# -------------------------------------------------------------------------
+# Natural Spectral Fusion style exponent scheduler for NorMuon
+# -------------------------------------------------------------------------
+
+# Default NSF schedule:
+# - 50% of each cycle: standard NorMuon (p = 0.5, Adam/RMS-like)
+# - 30%: milder adaptivity (p = 0.25)
+# - 15%: no adaptivity (p = 0.0, SGD-like per neuron)
+# - 5%: mild "anti-adaptive" (p = -0.25), emphasizing high-variance neurons
+NSF_DEFAULT_EXPONENTS = (0.5, 0.25, 0.0, -0.25)
+NSF_DEFAULT_PHASE_FRACTIONS = (0.50, 0.80, 0.95, 1.00)  # cumulative
+NSF_DEFAULT_CYCLE_STEPS = 2048  # one spectral cycle ~30% of the 7k-step run
+
+
+def _nsf_exponent(step: int,
+                  cycle_steps: int,
+                  exponents=NSF_DEFAULT_EXPONENTS,
+                  phase_fractions=NSF_DEFAULT_PHASE_FRACTIONS) -> float:
+    """
+    Natural Spectral Fusion-style exponent schedule over second-moment v.
+
+    We interpret v as a per-neuron variance; NorMuon currently uses
+        step_size = v^{-1/2}
+    We generalize to
+        step_size = v^{-p(t)}
+    where p(t) cycles over a set of values.
+
+    Args:
+        step:        integer training step (per optimizer group).
+        cycle_steps: how many steps in one full spectral cycle.
+        exponents:   tuple of p values.
+        phase_fractions:
+            cumulative fractions of the cycle where each exponent is active.
+            Must be same length as `exponents` and end at 1.0.
+
+    Returns:
+        p_t for this step.
+    """
+    if cycle_steps <= 0 or not exponents:
+        # Fallback: behave exactly like NorMuon (p = 0.5)
+        return 0.5
+
+    pos = (step % cycle_steps) / float(cycle_steps)  # in [0, 1)
+    for p, frac in zip(exponents, phase_fractions):
+        if pos < frac:
+            return p
+    return exponents[-1]
+
 
 class NorMuon(torch.optim.Optimizer):
     """
@@ -452,15 +520,47 @@ class NorMuon(torch.optim.Optimizer):
         9. wait for each all gather to complete and update params
     Empirically, leading with small params provides an additional 0.2s improvement.
     """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, beta2=0.95, custom_sizing=True):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2)
+    def __init__(
+        self,
+        params,
+        lr=0.02,
+        weight_decay=0.01,
+        momentum=0.95,
+        beta2=0.95,
+        custom_sizing=True,
+        # NEW: Natural Spectral Fusion parameters
+        nsf_cycle_steps: int = NSF_DEFAULT_CYCLE_STEPS,
+        nsf_exponents: tuple[float, ...] | None = None,
+        nsf_phase_fractions: tuple[float, ...] | None = None,
+        nsf_warmup_steps: int = 0,
+    ):
+        """
+        NorMuon with optional Natural Spectral Fusion on the neuron-wise variance.
+
+        If nsf_cycle_steps <= 0, behavior is exactly the original NorMuon.
+        """
+        defaults = dict(
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            beta2=beta2,
+            nsf_cycle_steps=nsf_cycle_steps,
+            nsf_warmup_steps=nsf_warmup_steps,
+        )
+
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
-        # custom sizing requires 8 GPUs
-        if custom_sizing and dist.get_world_size()==8:
+
+        # Store NSF schedule globally on the optimizer (read-only in step())
+        self.nsf_exponents = nsf_exponents or NSF_DEFAULT_EXPONENTS
+        self.nsf_phase_fractions = nsf_phase_fractions or NSF_DEFAULT_PHASE_FRACTIONS
+
+        if custom_sizing and dist.get_world_size() == 8:
             param_groups = self.generate_custom_param_groups(params)
         else:
             param_groups = self.generate_standard_param_groups(params)
+
         super().__init__(param_groups, defaults)
+
 
     def reset(self):
         # expose a reset for clearing buffers
@@ -475,10 +575,10 @@ class NorMuon(torch.optim.Optimizer):
         """
         groups = defaultdict(list)
         for param in params:
-            groups[(param.label, tuple(param.shape))].append(param)
+            groups[param.label].append(param)
 
         param_groups = []
-        for (_, _), group_params in groups.items():
+        for module_name, group_params in groups.items():
             chunk_size = (len(group_params) + self.world_size - 1) // self.world_size
             param_groups.append(dict(params=group_params, chunk_size=chunk_size))
 
@@ -493,17 +593,15 @@ class NorMuon(torch.optim.Optimizer):
         params_list = list(params)
         params_list.sort(key=lambda x: module_group_order.index(x.label))
 
+        idx = 0
+        group_sizes = [1, 10, 16, 16]
+        assert len(params_list) == sum(group_sizes)
         param_groups = []
-        for label in module_group_order:
-            label_params = [p for p in params_list if p.label == label]
-            if not label_params:
-                continue
-            shape_buckets = defaultdict(list)
-            for p in label_params:
-                shape_buckets[p.shape].append(p)
-            for _, group_params in shape_buckets.items():
-                chunk_size = (len(group_params) + self.world_size - 1) // self.world_size
-                param_groups.append(dict(params=group_params, chunk_size=chunk_size))
+        for size in group_sizes:
+            chunk_size = (size + self.world_size - 1) // self.world_size
+            group_params = params_list[idx: idx + size]
+            param_groups.append(dict(params=group_params, chunk_size=chunk_size))
+            idx += size
 
         return param_groups
 
@@ -528,10 +626,7 @@ class NorMuon(torch.optim.Optimizer):
                 device=params[0].device
             )
             for i, p in enumerate(params):
-                if p.grad is None:
-                    stacked_grads[i].zero_()
-                else:
-                    stacked_grads[i].copy_(p.grad, non_blocking=True)
+                stacked_grads[i].copy_(p.grad, non_blocking=True)
             if len(params) < padded_num_params:
                 stacked_grads[len(params):].zero_()
 
@@ -567,17 +662,13 @@ class NorMuon(torch.optim.Optimizer):
             updated_grads = grad_chunk[:num_params].lerp_(momentum_buffer, group["momentum"])
 
             grad_shape = updated_grads.shape
-            param_shape = params[module_idx].shape
-            is_fused_qkv = (
-                params[module_idx].label == 'attn'
-                and param_shape[-1] == 4 * param_shape[-2]
-            )
-            if is_fused_qkv:
+            if params[module_idx].label == 'attn':
                 # Reshape attn params from [hdim, dim*4] to [4,hdim,dim]
                 for p in params[module_idx:module_idx + num_params]:
                     assert p.label == 'attn'
                 updated_grads = updated_grads.view(4 * grad_shape[0], grad_shape[1], grad_shape[2] // 4)
             ref_param = params[module_idx]
+            param_shape = ref_param.shape
 
             if "second_momentum_buffer" not in group:
                 group["second_momentum_buffer"] = (torch.zeros_like(updated_grads[..., :, :1])
@@ -839,202 +930,59 @@ class AttnArgs:
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, attn_mode: str = "mha", num_kv_heads: int = None, mla_kv_dim: int = None, mla_rope_dim: int = 64, dsa_topk: int = 512):
+    def __init__(self, dim: int, head_dim: int, num_heads: int):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.dim = dim
         self.hdim = num_heads * head_dim
-        self.attn_mode = attn_mode
 
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
         std = 0.5 * (self.dim ** -0.5)
         bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
+        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
+        # https://x.com/hi_tysam/status/1879699187107033311
+        # make matrices the same shape as MLP to enable batched call in optimizer
+        self.qkvo_w = nn.Parameter(torch.empty(self.hdim, self.dim*4))
+        # label module to enable custom optimizer sizing
+        self.qkvo_w.label='attn'
 
-        if attn_mode == "mha":
-            # Standard multi-head attention
-            self.qkvo_w = nn.Parameter(torch.empty(self.hdim, self.dim*4))
-            self.qkvo_w.label='attn'
-            with torch.no_grad():
-                self.qkvo_w.view(4,self.hdim, self.dim)[:3].uniform_(-bound, bound)
-                self.qkvo_w.view(4,self.hdim, self.dim)[3].zero_()
-
-        elif attn_mode == "gqa":
-            # Grouped Query Attention (Llama 2 style)
-            self.num_kv_heads = num_kv_heads
-            assert num_heads % num_kv_heads == 0, "num_heads must be divisible by num_kv_heads"
-            self.num_q_per_kv = num_heads // num_kv_heads
-
-            self.q_w = nn.Parameter(torch.empty(self.hdim, self.dim))
-            self.kv_w = nn.Parameter(torch.empty(num_kv_heads * head_dim * 2, self.dim))
-            self.o_w = nn.Parameter(torch.empty(self.hdim, self.dim))
-
-            self.q_w.label = 'attn'
-            self.kv_w.label = 'attn'
-            self.o_w.label = 'attn'
-
-            with torch.no_grad():
-                self.q_w.uniform_(-bound, bound)
-                self.kv_w.uniform_(-bound, bound)
-                self.o_w.zero_()
-
-        elif attn_mode in ["mla", "dsa"]:
-            # Multi-head Latent Attention (DeepSeek-V2/V3 style) with decoupled RoPE
-            self.mla_kv_dim = mla_kv_dim
-            self.mla_rope_dim = mla_rope_dim
-            self.dsa_topk = dsa_topk if attn_mode == "dsa" else None
-
-            self.q_down = nn.Parameter(torch.empty(mla_kv_dim, self.dim))
-            self.q_up_nope = nn.Parameter(torch.empty(self.hdim, mla_kv_dim))
-            self.q_rope = nn.Parameter(torch.empty(num_heads * mla_rope_dim, mla_kv_dim))
-            self.q_rope_out = nn.Parameter(torch.empty(self.hdim, num_heads * mla_rope_dim))
-            self.kv_down = nn.Parameter(torch.empty(mla_kv_dim * 2, self.dim))
-            self.k_rope = nn.Parameter(torch.empty(mla_rope_dim, self.dim))
-            self.k_rope_out = nn.Parameter(torch.empty(self.num_heads * self.head_dim, mla_rope_dim))
-            self.k_up = nn.Parameter(torch.empty(self.num_heads * self.head_dim, mla_kv_dim))
-            self.v_up = nn.Parameter(torch.empty(self.num_heads * self.head_dim, mla_kv_dim))
-            self.o_w = nn.Parameter(torch.empty(self.hdim, self.dim))
-            self.o_mla = nn.Parameter(torch.empty(self.hdim, self.hdim))
-
-            for p in [self.q_down, self.q_up_nope, self.q_rope, self.q_rope_out, self.kv_down, self.k_rope, self.k_rope_out, self.k_up, self.v_up, self.o_w, self.o_mla]:
-                p.label = 'attn'
-
-            with torch.no_grad():
-                self.q_down.uniform_(-bound, bound)
-                self.q_up_nope.uniform_(-bound, bound)
-                self.q_rope.uniform_(-bound, bound)
-                self.q_rope_out.uniform_(-bound, bound)
-                self.kv_down.uniform_(-bound, bound)
-                self.k_rope.uniform_(-bound, bound)
-                self.k_rope_out.uniform_(-bound, bound)
-                self.k_up.uniform_(-bound, bound)
-                self.v_up.uniform_(-bound, bound)
-                self.o_w.zero_()
-                self.o_mla.zero_()
-
-            if attn_mode == "dsa":
-                self.indexer_q_w = nn.Parameter(torch.empty(num_heads * mla_kv_dim, self.dim))
-                self.indexer_k_w = nn.Parameter(torch.empty(num_heads * mla_kv_dim, self.dim))
-                self.indexer_q_w.label = 'attn'
-                self.indexer_k_w.label = 'attn'
-                with torch.no_grad():
-                    self.indexer_q_w.uniform_(-bound, bound)
-                    self.indexer_k_w.uniform_(-bound, bound)
-        else:
-            raise ValueError(f"Unknown attn_mode: {attn_mode}")
+        with torch.no_grad():
+            self.qkvo_w.view(4,self.hdim, self.dim)[:3].uniform_(-bound, bound) # init QKV weights
+            self.qkvo_w.view(4,self.hdim, self.dim)[3].zero_() # init output weights to zero
 
         # sparse gated attention to enable context based no-op by @classiclarryd
         self.attn_gate = CastedLinear(12, num_heads)
+        # label module to enable custom optimizer sizing
         self.attn_gate.weight.label = 'attn_gate'
 
     def forward(self, x: Tensor, attn_args: AttnArgs):
-        B, T = x.size(0), x.size(1)
+        B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
+        # unpack attention args
         cos, sin = attn_args.cos, attn_args.sin
         ve, sa_lambdas = attn_args.ve, attn_args.sa_lambdas
         seqlens, attn_scale, bm_size = attn_args.seqlens, attn_args.attn_scale, attn_args.bm_size
+
+        q, k, v = F.linear(x, self.qkvo_w.view(4, self.hdim, self.dim)[:3].flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        q, k = rotary(q, cos, sin), rotary(k, cos, sin)
+        if ve is not None:
+            v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v) # @ KoszarskyB & @Grad62304977
+        else: # skip mid-layers token value embeddings by @YouJiacheng
+            v = sa_lambdas[0] * v
+
         max_len = args.train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
-        if self.attn_mode == "mha":
-            q, k, v = F.linear(x, self.qkvo_w.view(4, self.hdim, self.dim)[:3].flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-            q, k = norm(q), norm(k)
-            q, k = rotary(q, cos, sin), rotary(k, cos, sin)
-            if ve is not None:
-                v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v)
-            else:
-                v = sa_lambdas[0] * v
-
-            y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                            causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
-            y = y.view(B, T, self.num_heads, self.head_dim)
-            y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
-            y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
-            y = F.linear(y, self.qkvo_w.view(4, self.hdim, self.dim)[3].type_as(y))
-
-        elif self.attn_mode == "gqa":
-            q = F.linear(x, self.q_w.type_as(x)).view(B, T, self.num_heads, self.head_dim)
-            kv = F.linear(x, self.kv_w.type_as(x)).view(B, T, self.num_kv_heads, 2, self.head_dim)
-            k, v = kv.unbind(dim=3)
-
-            q, k = norm(q), norm(k)
-            q, k = rotary(q, cos, sin), rotary(k, cos, sin)
-
-            if ve is not None:
-                ve_kv = ve.view(B, T, self.num_heads, self.head_dim)
-                ve_kv = ve_kv.view(B, T, self.num_kv_heads, self.num_q_per_kv, self.head_dim).mean(dim=3)
-                v = sa_lambdas[0] * v + sa_lambdas[1] * ve_kv
-            else:
-                v = sa_lambdas[0] * v
-
-            k = k.repeat_interleave(self.num_q_per_kv, dim=2)
-            v = v.repeat_interleave(self.num_q_per_kv, dim=2)
-
-            y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                            causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
-            y = y.view(B, T, self.num_heads, self.head_dim)
-            y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
-            y = y.contiguous().view(B, T, self.num_heads * self.head_dim)
-            y = F.linear(y, self.o_w.type_as(y))
-
-        elif self.attn_mode in ["mla", "dsa"]:
-            # Compress to latent space
-            c_q = F.linear(x, self.q_down.type_as(x))  # (B, T, mla_kv_dim)
-            c_kv = F.linear(x, self.kv_down.type_as(x))  # (B, T, mla_kv_dim * 2)
-            c_k_nope, c_v = c_kv.chunk(2, dim=-1)  # each (B, T, mla_kv_dim)
-
-            # Normalize compressed representations
-            c_q, c_k_nope = norm(c_q), norm(c_k_nope)
-
-            # Q: NoPE component (non-positional)
-            q_nope = F.linear(c_q, self.q_up_nope.type_as(c_q)).view(B, T, self.num_heads, self.head_dim)
-
-            # Q: RoPE component (positional, decoupled)
-            # rotary function chunks by 2, so input needs mla_rope_dim and cos/sin need mla_rope_dim // 2
-            rope_dim = self.mla_rope_dim // 2
-            rope_cos, rope_sin = cos[..., :rope_dim], sin[..., :rope_dim]
-            assert rope_cos.size(-1) == rope_dim, f"YaRN rope dims must cover MLA rope size: got {rope_cos.size(-1)}, need {rope_dim}"
-            q_rope_latent = F.linear(c_q, self.q_rope.type_as(c_q)).view(B, T, self.num_heads, self.mla_rope_dim)
-            q_rope_latent = rotary(q_rope_latent, rope_cos, rope_sin)
-            # Flatten last two dims for linear projection, then reshape back
-            q_rope_proj = F.linear(q_rope_latent.view(B, T, self.num_heads * self.mla_rope_dim), self.q_rope_out.type_as(c_q)).view(B, T, self.num_heads, self.head_dim)
-            q = q_nope + q_rope_proj
-
-            # K: NoPE component (from compressed latent space)
-            k_nope = F.linear(c_k_nope, self.k_up.type_as(x)).view(B, T, self.num_heads, self.head_dim)
-
-            # K: RoPE component (positional, decoupled, applied directly to input)
-            k_rope = F.linear(x, self.k_rope.type_as(x))  # (B, T, mla_rope_dim)
-            k_rope = rotary(k_rope.unsqueeze(2), rope_cos, rope_sin).squeeze(2)  # (B, T, mla_rope_dim)
-            k_rope_proj = F.linear(k_rope, self.k_rope_out.type_as(k_rope)).view(B, T, self.num_heads, self.head_dim)
-            k = k_nope + k_rope_proj
-
-            # V: up-project from compressed latent space (no positional encoding)
-            v = F.linear(c_v, self.v_up.type_as(x)).view(B, T, self.num_heads, self.head_dim)
-
-            # Apply value embeddings if provided
-            if ve is not None:
-                v = sa_lambdas[0] * v + sa_lambdas[1] * ve.view_as(v)
-            else:
-                v = sa_lambdas[0] * v
-
-            # Compute attention
-            y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
-                                                            max_seqlen_q=max_len, max_seqlen_k=max_len,
-                                                            causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
-            y = y.view(B, T, self.num_heads, self.head_dim)
-
-            # Apply attention gate
-            y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
-
-            # Output projection: o_mla (hdim -> hdim) then o_w (hdim -> dim)
-            # Combine into single efficient projection by flattening once
-            y = y.view(B, T, self.hdim)
-            y = F.linear(y, self.o_mla.type_as(y))
-            y = F.linear(y, self.o_w.type_as(y))
-
+        # use flash_attn over flex_attn @varunneal. flash_attn_varlen suggested by @YouJiacheng
+        y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                        max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                        causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
+        y = y.view(B, T, self.num_heads, self.head_dim)
+        y = y * torch.sigmoid(self.attn_gate(x[..., :self.attn_gate.weight.size(-1)])).view(B, T, self.num_heads, 1)
+        y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
+        y = F.linear(y, self.qkvo_w.view(4, self.hdim, self.dim)[3].type_as(y))
         return y
 
 
@@ -1059,14 +1007,19 @@ class MLP(nn.Module):
 
     def forward(self, x: Tensor):
         x = F.linear(x, self.c_fc.T.type_as(x))
+        # 2. [NEW] Compete! 
+        # Loud neurons suppress quiet ones via normalization. 
+        # This creates a "Winner-Take-All" dynamic before the non-linearity.
         x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
         x = F.linear(x, self.c_proj.type_as(x))
         return x
 
 class Block(nn.Module):
-    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int, attn_mode: str = "mha", num_kv_heads: int = None, mla_kv_dim: int = None, mla_rope_dim: int = 64, dsa_topk: int = 512):
+    def __init__(self, dim: int, head_dim: int, num_heads: int, layer_idx: int):
         super().__init__()
-        self.attn = CausalSelfAttention(dim, head_dim, num_heads, attn_mode, num_kv_heads, mla_kv_dim, mla_rope_dim, dsa_topk) if layer_idx not in [0, 7] else None
+        # skip attention of blocks.7 (the 8th layer) by @YouJiacheng
+        self.attn = CausalSelfAttention(dim, head_dim, num_heads) if layer_idx not in [0, 7] else None
+        # skip MLP blocks for first MLP layer by @EmelyanenkoK
         self.mlp = MLP(dim) if layer_idx != 0 else None
 
     def forward(self, x: Tensor, x0: Tensor, lambdas: Tensor, attn_args: AttnArgs):
@@ -1084,15 +1037,17 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int, attn_mode: str = "mha", num_kv_heads: int = None, mla_kv_dim: int = None, mla_rope_dim: int = 64, dsa_topk: int = 512):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, head_dim: int, model_dim: int, max_seq_len: int):
         super().__init__()
         vocab_size = next_multiple_of_n(vocab_size, n=128)
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.smear_gate = CastedLinear(12, 1)
         # label modules to enable custom optimizer sizing
         self.smear_gate.weight.label = 'smear_gate'
+        # token value embeddings by @KoszarskyB - inspired by @Grad62304977's value residual implementation following https://arxiv.org/abs/2410.17897
+        # value embedding code simplification inspired by @ragulpr https://github.com/KellerJordan/modded-nanogpt/pull/78
         self.value_embeds = nn.ModuleList([nn.Embedding(vocab_size, model_dim) for _ in range(3)])
-        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i, attn_mode, num_kv_heads, mla_kv_dim, mla_rope_dim, dsa_topk) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, head_dim, num_heads, i) for i in range(num_layers)])
         self.yarn = Yarn(head_dim, max_seq_len)
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency.
         # suggested to me by @Grad62304977. this originates from Karpathy's experiments.
@@ -1119,6 +1074,7 @@ class GPT(nn.Module):
                 ]
             )
         )
+
         # set learning rates
         for param in self.embed.parameters():
             param.lr_mul = 75.
@@ -1126,6 +1082,8 @@ class GPT(nn.Module):
             param.lr_mul = 75.
         self.lm_head.weight.lr_mul = 1.0
         self.scalars.lr_mul = 5.0
+
+
 
     def forward(self, input_seq: Tensor, target_seq: Tensor, seqlens: Tensor, ws_short: int, ws_long: int):
         assert input_seq.ndim == 1
@@ -1260,7 +1218,7 @@ class BOSFinder:
             cur_len = 0
             while cur_len <= num_tokens_local:
                 if idx >= n:
-                    raise StopIteration(f"Insufficient BOS positions at idx={idx}; hit tail of shard.")
+                    raise StopIteration(f"Insufficient BOS ahead of position {cur}; hit tail of shard.")
                 cur = self.bos_idx[idx]
                 starts[r].append(cur)
                 end = min(self.bos_idx[idx + 1] if idx + 1 < n else self.size,
@@ -1366,7 +1324,7 @@ def distributed_data_generator(filename_pattern: str, num_tokens: int, max_seq_l
         if new_params is not None:
             # makes it possible for generator to receive new (num_tokens, max_seq_len, grad_accum_steps) via .send()
             new_num_tokens, new_max_seq_len, new_grad_accum_steps = new_params
-            assert new_num_tokens % (world_size * new_grad_accum_steps) == 0, "Num tokens must be divisible by world size"
+            assert new_num_tokens % (world_size * grad_accum_steps) == 0, "Num tokens must be divisible by world size"
             num_tokens = new_num_tokens
             max_seq_len = new_max_seq_len
             grad_accum_steps = new_grad_accum_steps
@@ -1389,17 +1347,6 @@ class Hyperparameters:
     num_extension_iterations: int = 40  # number of steps to continue training at final lr and ws
     num_iterations: int = num_scheduled_iterations + num_extension_iterations
     cooldown_frac: float = 0.50  # fraction of num_scheduled_iterations spent cooling down the learning rate
-    # attention architecture options
-    attn_mode: str = "gqa"  # "mha", "gqa", "mla", or "dsa"
-    num_kv_heads: int = 2  # KV heads for GQA
-    mla_kv_dim: int = 256  # latent KV dim for MLA/DSA
-    mla_rope_dim: int = 64  # decoupled RoPE dim for MLA/DSA
-    dsa_topk: int = 512  # top-k tokens for sparse attention
-    # Efficiency intuition:
-    # - MHA baseline cost ~O(num_heads * T * head_dim) memory and ~O(num_heads * T^2) flops.
-    # - GQA reduces K/V heads from num_heads -> num_kv_heads: memory/compute for K/V scales by (num_kv_heads / num_heads).
-    # - MLA compresses K/V to mla_kv_dim instead of head_dim: cost roughly scales by (mla_kv_dim / head_dim) for K/V, with Q kept at head_dim.
-    # - DSA further limits attention to dsa_topk tokens per query: effective T in the softmax becomes dsa_topk instead of full T (in this file we gather top-k K/V before attention).
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
     val_loss_every: int = 250  # every how many steps to evaluate val loss? 0 for only at the end
@@ -1430,12 +1377,10 @@ master_process = (rank == 0) # this process will do logging, checkpointing etc.
 
 # begin logging
 logfile = None
-loss_logfile = None
 if master_process:
     run_id = args.run_id
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
-    loss_logfile = f"logs/{run_id}_loss.jsonl"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -1443,15 +1388,6 @@ def print0(s, console=False):
             if console:
                 print(s)
             print(s, file=f)
-
-def log_loss_record(step: int, phase: str, loss_mean: float):
-    if not master_process:
-        return
-    import json
-    record = {"step": int(step), "phase": phase, "loss": float(loss_mean)}
-    line = json.dumps(record, separators=(",", ":"))
-    with open(loss_logfile, "a", encoding="utf-8") as f:
-        f.write(line + "\n")
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -1473,12 +1409,7 @@ model: nn.Module = GPT(
     num_heads=6,
     head_dim=128,
     model_dim=768,
-    max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size),
-    attn_mode=args.attn_mode,
-    num_kv_heads=args.num_kv_heads,
-    mla_kv_dim=args.mla_kv_dim,
-    mla_rope_dim=args.mla_rope_dim,
-    dsa_topk=args.dsa_topk
+    max_seq_len=max(args.train_batch_size, args.val_batch_size) // (grad_accum_steps * world_size)
 ).cuda()
 for m in model.modules():
     if isinstance(m, (nn.Embedding, nn.Linear)):
@@ -1504,6 +1435,7 @@ optimizer1 = DistAdam(
     weight_decay=0.0,
 )
 optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
+# optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.05, momentum=0.95, beta2=0.95, weight_decay=1.2)
 optimizers = [optimizer1, optimizer2]
 for opt in optimizers:
     for group in opt.param_groups:
@@ -1517,6 +1449,7 @@ def get_lr(step: int):
     if x >= 1 - args.cooldown_frac:
         w = (1 - x) / args.cooldown_frac
         lr = w * 1.0 + (1 - w) * 0.1
+
     return lr
 
 def get_ws(step: int):
@@ -1640,7 +1573,6 @@ for step in range(train_steps + 1):
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
         print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
-        log_loss_record(step, "val", val_loss.item() if hasattr(val_loss, "item") else float(val_loss))
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1655,23 +1587,18 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    loss_accum = 0.0
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizer on the last iteration before we step it
         if idx == grad_accum_steps - 1 and step % 2 == 1:
             optimizers[0].should_sync = True
 
         inputs, targets, cum_seqlens = next(train_loader)
-        loss_mb = model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps
-        loss_accum += loss_mb.detach().item()
-        loss_mb.backward()
+        (model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps).backward()
     step_optimizers(step, optimizers, model)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
     print0(f"step:{step+1}/{train_steps} train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms/(step + 1):.2f}ms", console=True)
-    train_loss_mean = loss_accum * grad_accum_steps / args.train_batch_size
-    log_loss_record(step + 1, "train", train_loss_mean)
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
