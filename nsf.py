@@ -787,7 +787,10 @@ class NorMuonEMA(NorMuon):
             for p in group["params"]:
                 if p is None or not p.requires_grad:
                     continue
-                ema = self.state[p]["ema"]
+                state = self.state[p]
+                if "ema" not in state:
+                    state["ema"] = p.detach().clone()
+                ema = state["ema"]
                 # ema = beta * ema + (1-beta) * p
                 ema.add_(p.detach() - ema, alpha=one_minus_beta)
 
@@ -812,7 +815,10 @@ class NorMuonEMA(NorMuon):
             for p in group["params"]:
                 if p is None or not p.requires_grad:
                     continue
-                ema = self.state[p]["ema"]
+                state = self.state[p]
+                if "ema" not in state:
+                    state["ema"] = p.detach().clone()
+                ema = state["ema"]
                 p.detach().copy_(ema.to(dtype=p.dtype))
 
 
