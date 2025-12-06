@@ -1639,9 +1639,9 @@ for step in range(train_steps + 1):
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:
             ws_long = args.ws_validate_post_yarn_ext
-        if isinstance(optimizers[1], NorMuonEMA):
-            print("Applying EMA weights before final evaluation/checkpoint...")
-            optimizers[1].apply_ema_to_weights()
+            if isinstance(optimizers[1], NorMuonEMA):
+                print("Applying EMA weights before final evaluation/checkpoint...")
+                optimizers[1].apply_ema_to_weights()
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
