@@ -482,7 +482,6 @@ def _nsf_exponent(step: int,
     return exponents[-1]
 
 
-
 class NorMuon(torch.optim.Optimizer):
     """
     Muon - MomentUm Orthogonalized by Newton-schulz
@@ -521,15 +520,47 @@ class NorMuon(torch.optim.Optimizer):
         9. wait for each all gather to complete and update params
     Empirically, leading with small params provides an additional 0.2s improvement.
     """
-    def __init__(self, params, lr=0.02, weight_decay=0.01, momentum=0.95, beta2=0.95, custom_sizing=True):
-        defaults = dict(lr=lr, weight_decay=weight_decay, momentum=momentum, beta2=beta2)
+    def __init__(
+        self,
+        params,
+        lr=0.02,
+        weight_decay=0.01,
+        momentum=0.95,
+        beta2=0.95,
+        custom_sizing=True,
+        # NEW: Natural Spectral Fusion parameters
+        nsf_cycle_steps: int = NSF_DEFAULT_CYCLE_STEPS,
+        nsf_exponents: tuple[float, ...] | None = None,
+        nsf_phase_fractions: tuple[float, ...] | None = None,
+        nsf_warmup_steps: int = 0,
+    ):
+        """
+        NorMuon with optional Natural Spectral Fusion on the neuron-wise variance.
+
+        If nsf_cycle_steps <= 0, behavior is exactly the original NorMuon.
+        """
+        defaults = dict(
+            lr=lr,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            beta2=beta2,
+            nsf_cycle_steps=nsf_cycle_steps,
+            nsf_warmup_steps=nsf_warmup_steps,
+        )
+
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
-        # custom sizing requires 8 GPUs
-        if custom_sizing and dist.get_world_size()==8:
+
+        # Store NSF schedule globally on the optimizer (read-only in step())
+        self.nsf_exponents = nsf_exponents or NSF_DEFAULT_EXPONENTS
+        self.nsf_phase_fractions = nsf_phase_fractions or NSF_DEFAULT_PHASE_FRACTIONS
+
+        if custom_sizing and dist.get_world_size() == 8:
             param_groups = self.generate_custom_param_groups(params)
         else:
             param_groups = self.generate_standard_param_groups(params)
+
         super().__init__(param_groups, defaults)
+
 
     def reset(self):
         # expose a reset for clearing buffers
@@ -667,16 +698,64 @@ class NorMuon(torch.optim.Optimizer):
             else:
                 v_chunk = polar_express(updated_grads)
 
-            # NorMuon: second_momentum_buffer tracks squared magnitude of gradients along one dim (https://arxiv.org/pdf/2510.05491)
+            second_momentum_buffer = group["second_momentum_buffer"]
+
+            # NorMuon: second_momentum_buffer tracks squared magnitude of gradients
+            # along one dim (Adafactor-style low-rank second moment).
             v_norm = v_chunk.norm(dim=(-2, -1), keepdim=True)
-            v_mean = v_chunk.square().mean(dim=-1 if param_shape[-2] >= param_shape[-1] else -2, keepdim=True)
-            second_momentum_buffer.lerp_(v_mean.to(dtype=ref_param.dtype), 1 - group["beta2"])
-            step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt_()
+            v_mean = v_chunk.square().mean(
+                dim=-1 if param_shape[-2] >= param_shape[-1] else -2,
+                keepdim=True,
+            )
+
+            # EMA update of per-neuron variance (unchanged from NorMuon)
+            second_momentum_buffer.lerp_(
+                v_mean.to(dtype=ref_param.dtype),
+                1 - group["beta2"],
+            )
+
+            # --------------------------- NEW: NSF scaling ----------------------------
+            cycle_steps = group.get("nsf_cycle_steps", NSF_DEFAULT_CYCLE_STEPS)
+            warmup_steps = group.get("nsf_warmup_steps", 0)
+
+            # Per-group step counter for NSF (kept in optimizer state)
+            group_step = group.get("nsf_step", 0) + 1
+            group["nsf_step"] = group_step
+
+            # During warmup, behave exactly like NorMuon (p = 0.5)
+            if cycle_steps <= 0 or group_step <= warmup_steps:
+                p_t = 0.5
+            else:
+                # Use the global NSF schedule stored on the optimizer
+                p_t = _nsf_exponent(
+                    step=group_step - warmup_steps,
+                    cycle_steps=cycle_steps,
+                    exponents=self.nsf_exponents,
+                    phase_fractions=self.nsf_phase_fractions,
+                )
+
+            # Convert second moment into a multiplicative step size:
+            #   NorMuon: step_size = v^{-1/2}
+            #   NSF-NorMuon: step_size = v^{-p_t}
+            # NOTE: we do NOT modify second_momentum_buffer in-place here.
+            denom = second_momentum_buffer.clamp_min(1e-10)
+            if abs(p_t) < 1e-8:
+                # p_t ~ 0 => no per-neuron adaptivity, just re-normalization below
+                step_size = torch.ones_like(denom)
+            else:
+                step_size = denom.pow(-p_t)
+
+            # Apply per-neuron reweighting
             v_chunk.mul_(step_size)
+
+            # ------------------------------------------------------------------------
+            # Re-normalize to preserve the original Frobenius norm of the update chunk
             v_norm_new = v_chunk.norm(dim=(-2, -1), keepdim=True)
             v_chunk.mul_(v_norm / v_norm_new.clamp_min_(1e-10))
 
+            # Restore original shape and continue as before
             v_chunk = v_chunk.view(grad_shape)
+
 
             updated_params = torch.empty_like(grad_chunk)
             param_chunk = torch.stack(params[module_idx:module_idx + num_params]) if num_params > 0 else torch.zeros_like(v_chunk)
@@ -718,102 +797,6 @@ class NorMuon(torch.optim.Optimizer):
             unstacked_params = torch.unbind(stacked_params)
             for i, p in enumerate(orig_params):
                 p.copy_(unstacked_params[i], non_blocking=True)
-
-class NorMuonEMA(NorMuon):
-    """
-    NorMuon with Spectral EMA (slow weights).
-
-    - Keeps NorMuon's orthogonalized, variance-adapted updates for training ("fast" weights).
-    - Maintains an exponential moving average of each parameter ("slow" weights).
-    - You train exactly as before; at the end, you swap in the EMA weights for eval/checkpoint.
-
-    This is analogous to SPlus's iterate-averaging scheme applied to a Muon-style optimizer.
-    """
-
-    def __init__(
-        self,
-        params,
-        *args,
-        ema_decay: float = 0.99,
-        ema_warmup_steps: int = 0,
-        **kwargs,
-    ):
-        """
-        Args:
-            ema_decay: EMA factor β. Higher = slower, smoother weights.
-                       0.99–0.997 is a good search range.
-            ema_warmup_steps: steps before we start averaging (we just copy weights).
-        Other args / kwargs are passed straight to NorMuon.
-        """
-        super().__init__(params, *args, **kwargs)
-        self.ema_decay = float(ema_decay)
-        self.ema_warmup_steps = int(ema_warmup_steps)
-        self._ema_initialized = False
-        self._global_step = 0
-
-    @torch.no_grad()
-    def _init_ema_if_needed(self):
-        if self._ema_initialized:
-            return
-        # Attach an 'ema' tensor to the state of each parameter NorMuon manages.
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p is None or not p.requires_grad:
-                    continue
-                state = self.state[p]
-                # clone current weights as EMA starting point
-                state["ema"] = p.detach().clone()
-        self._ema_initialized = True
-
-    @torch.no_grad()
-    def _update_ema(self):
-        self._global_step += 1
-        self._init_ema_if_needed()
-
-        # During warmup, just track the current weights.
-        if self._global_step <= self.ema_warmup_steps:
-            for group in self.param_groups:
-                for p in group["params"]:
-                    if p is None or not p.requires_grad:
-                        continue
-                    ema = self.state[p]["ema"]
-                    ema.copy_(p.detach())
-            return
-
-        beta = self.ema_decay
-        one_minus_beta = 1.0 - beta
-
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p is None or not p.requires_grad:
-                    continue
-                ema = self.state[p]["ema"]
-                # ema = beta * ema + (1-beta) * p
-                ema.add_(p.detach() - ema, alpha=one_minus_beta)
-
-    @torch.no_grad()
-    def step(self, closure=None):
-        """
-        Run a normal NorMuon step, then update EMA.
-        """
-        loss = super().step(closure)
-        self._update_ema()
-        return loss
-
-    @torch.no_grad()
-    def apply_ema_to_weights(self):
-        """
-        Copy EMA weights into the live parameters in-place.
-
-        Call this ONCE at the end of training, before final validation / checkpoint.
-        """
-        self._init_ema_if_needed()
-        for group in self.param_groups:
-            for p in group["params"]:
-                if p is None or not p.requires_grad:
-                    continue
-                ema = self.state[p]["ema"]
-                p.detach().copy_(ema.to(dtype=p.dtype))
 
 
 class DistAdam(torch.optim.Optimizer):
@@ -1511,10 +1494,17 @@ optimizer1 = DistAdam(
     weight_decay=0.0,
 )
 # optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.03, momentum=0.95, beta2=0.95, weight_decay=1.2)
-optimizer2 = NorMuonEMA(hidden_matrix_params + gate_params, lr=0.04, 
-    momentum=0.95, beta2=0.95, weight_decay=1.2,
-    ema_decay=0.995,         # good starting point
-    ema_warmup_steps=500,    # let things spin up a bit    
+optimizer2 = NorMuon(
+    hidden_matrix_params + gate_params,
+    lr=0.04,              # small bump; NorMuon often tolerates slightly higher LR
+    weight_decay=1.2,
+    momentum=0.95,
+    beta2=0.95,
+    nsf_cycle_steps=2048,  # as defined above
+    nsf_warmup_steps=256,  # behave like vanilla NorMuon for first ~256 steps
+    # You can also override exponents/phase fractions here if desired:
+    # nsf_exponents=(0.6, 0.3, 0.0, -0.2),
+    # nsf_phase_fractions=(0.5, 0.8, 0.95, 1.0),
 )
 
 # optimizer2 = NorMuon(hidden_matrix_params + gate_params, lr=0.05, momentum=0.95, beta2=0.95, weight_decay=1.2)
@@ -1639,9 +1629,6 @@ for step in range(train_steps + 1):
     if last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0):
         if last_step:
             ws_long = args.ws_validate_post_yarn_ext
-        if isinstance(optimizers[1], NorMuonEMA):
-            print("Applying EMA weights before final evaluation/checkpoint...")
-            optimizers[1].apply_ema_to_weights()
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.perf_counter() - t0)
