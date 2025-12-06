@@ -9,6 +9,7 @@ import math
 import threading
 import time
 import uuid
+import json
 from dataclasses import dataclass
 from collections import defaultdict
 from itertools import accumulate
@@ -1369,6 +1370,7 @@ if master_process:
     run_id = args.run_id
     os.makedirs("logs", exist_ok=True)
     logfile = f"logs/{run_id}.txt"
+    loss_logfile = f"logs/{run_id}_loss.jsonl"
     print(logfile)
 def print0(s, console=False):
     if master_process:
@@ -1376,6 +1378,14 @@ def print0(s, console=False):
             if console:
                 print(s)
             print(s, file=f)
+
+def log_loss_record(step: int, phase: str, loss_mean: float):
+    if not master_process:
+        return
+    record = {"step": int(step), "phase": phase, "loss": float(loss_mean)}
+    line = json.dumps(record, separators=(",", ":"))
+    with open(loss_logfile, "a", encoding="utf-8") as f:
+        f.write(line + "\n")
 
 # begin by printing this file (the Python code)
 print0(code)
@@ -1560,7 +1570,9 @@ for step in range(train_steps + 1):
         val_loss /= val_steps
         del val_loader
         dist.all_reduce(val_loss, op=dist.ReduceOp.AVG)
-        print0(f"step:{step}/{train_steps} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        val_loss_item = float(val_loss)
+        print0(f"step:{step}/{train_steps} val_loss:{val_loss_item:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/max(step, 1):.2f}ms", console=True)
+        log_loss_record(step, "val", val_loss_item)
         model.train()
         # start the clock again
         torch.cuda.synchronize()
@@ -1575,14 +1587,18 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
+    train_loss_accum = 0.0
     for idx in range(grad_accum_steps):
         # enable gradient sync for the DistAdam optimizer on the last iteration before we step it
         if idx == grad_accum_steps - 1 and step % 2 == 1:
             optimizers[0].should_sync = True
 
         inputs, targets, cum_seqlens = next(train_loader)
-        (model(inputs, targets, cum_seqlens, ws_short, ws_long) / grad_accum_steps).backward()
+        loss = model(inputs, targets, cum_seqlens, ws_short, ws_long)
+        train_loss_accum += float(loss)
+        (loss / grad_accum_steps).backward()
     step_optimizers(step, optimizers, model)
+    log_loss_record(step + 1, "train", train_loss_accum / grad_accum_steps)
 
     # logging
     approx_training_time_ms = training_time_ms + 1000 * (time.perf_counter() - t0)
