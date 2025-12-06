@@ -1013,24 +1013,37 @@ class CausalSelfAttention(nn.Module):
                 indexer_scores = indexer_scores.masked_fill(causal_mask.view(1, 1, T, T), float('-inf'))
 
                 k_sparse = min(self.dsa_topk, T)
-                topk_scores, topk_indices = torch.topk(indexer_scores, k=k_sparse, dim=-1)
+                if k_sparse >= T:
+                    y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
+                                                                    max_seqlen_q=max_len, max_seqlen_k=max_len,
+                                                                    causal=True, softmax_scale=attn_scale, window_size=(bm_size, 0))
+                    y = y.view(B, T, self.num_heads, self.head_dim)
+                else:
+                    _, topk_indices = torch.topk(indexer_scores, k=k_sparse, dim=-1)
+                    q_heads = q.permute(0, 2, 1, 3)  # (B,H,T,D)
+                    k_heads = k.permute(0, 2, 1, 3)
+                    v_heads = v.permute(0, 2, 1, 3)
+                    y_heads = torch.empty_like(q_heads)
 
-                k_heads = k.permute(0, 2, 1, 3)  # (B, H, T, D)
-                v_heads = v.permute(0, 2, 1, 3)
-                gather_idx = topk_indices.unsqueeze(-1).expand(-1, -1, -1, -1, self.head_dim)
-                k_sel = torch.gather(k_heads.unsqueeze(2).expand(-1, -1, T, -1, -1), 3, gather_idx)
-                v_sel = torch.gather(v_heads.unsqueeze(2).expand(-1, -1, T, -1, -1), 3, gather_idx)
+                    arange_t = torch.arange(T, device=x.device, dtype=topk_indices.dtype).view(1, 1, T, 1)
+                    for h in range(self.num_heads):
+                        idx_h = topk_indices[:, h]  # (B,T,k)
+                        gather_idx = idx_h.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)  # (B,T,k,D)
 
-                q_heads = q.permute(0, 2, 1, 3)  # (B,H,T,D)
-                scores = (q_heads.unsqueeze(3) * k_sel).sum(dim=-1) * attn_scale  # (B,H,T,k)
+                        k_exp = k_heads[:, h].unsqueeze(2).expand(-1, -1, k_sparse, -1)
+                        v_exp = v_heads[:, h].unsqueeze(2).expand(-1, -1, k_sparse, -1)
+                        k_sel = torch.gather(k_exp, 1, gather_idx)
+                        v_sel = torch.gather(v_exp, 1, gather_idx)
 
-                arange_t = torch.arange(T, device=x.device).view(1, 1, T, 1)
-                causal_mask_sel = topk_indices > arange_t
-                scores = scores.masked_fill(causal_mask_sel, float('-inf'))
+                        scores = (q_heads[:, h].unsqueeze(2) * k_sel).sum(dim=-1) * attn_scale  # (B,T,k)
+                        causal_mask_sel = idx_h > arange_t  # (B,T,k)
+                        scores = scores.masked_fill(causal_mask_sel, float('-inf'))
 
-                attn_prob = torch.softmax(scores, dim=-1)
-                y_heads = torch.einsum('bhtk,bhtkd->bhtd', attn_prob, v_sel)
-                y = y_heads.permute(0, 2, 1, 3).contiguous()
+                        attn_prob = torch.softmax(scores, dim=-1)
+                        y_h = torch.einsum('btk,btkd->btd', attn_prob, v_sel)
+                        y_heads[:, h] = y_h
+
+                    y = y_heads.permute(0, 2, 1, 3).contiguous()
             else:
                 y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                                 max_seqlen_q=max_len, max_seqlen_k=max_len,
