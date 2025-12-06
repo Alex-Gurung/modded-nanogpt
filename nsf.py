@@ -796,7 +796,7 @@ class NorMuonEMA(NorMuon):
         """
         Run a normal NorMuon step, then update EMA.
         """
-        loss = super().step(closure)
+        loss = super().step()
         self._update_ema()
         return loss
 
