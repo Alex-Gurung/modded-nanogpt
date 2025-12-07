@@ -762,14 +762,7 @@ register_tool("read_benchmark_history", ReadHistoryTool)
 
 def build_llm() -> LLM:
     """Build the LLM client (assumes OpenAI-compatible endpoint, e.g. vLLM)."""
-    # raw_model = os.getenv("LLM_MODEL", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
-    raw_model = "Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8"
-#     VLLM_USE_DEEP_GEMM=1 vllm serve Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
-#   --max-model-len 131072 \
-#   --enable-expert-parallel \
-#   --data-parallel-size 8 \
-#   --enable-auto-tool-choice \
-#   --tool-call-parser qwen3_coder
+    raw_model = os.getenv("LLM_MODEL", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
 
     # Give litellm a provider prefix so it knows how to route the call.
     # vLLM will still see the bare model name "Qwen/Qwen3-Coder-30B-A3B-Instruct".
