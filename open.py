@@ -48,6 +48,11 @@ RUN_HISTORY_FILE_NAME = "agent_logs/benchmark_runs.jsonl"
 TAVILY_MAX_CALLS = int(os.getenv("TAVILY_MAX_CALLS", "20"))
 _tavily_calls_used = 0
 
+import uuid
+
+conversation_id = uuid.uuid4()
+persistence_dir = "./.conversations"
+
 
 # =============================================================================
 # Helper functions
@@ -806,10 +811,11 @@ def main() -> None:
     llm = build_llm()
     agent = build_agent(llm)
 
-    conversation = Conversation(agent=agent, workspace=repo_root)
+    conversation = Conversation(agent=agent, workspace=repo_root, conversation_id=conversation_id, persistence_dir=persistence_dir)
 
     system_prompt = """
-You are an autonomous research engineer improving the modded-nanogpt benchmark.
+You are an autonomous research engineer improving the modded-nanogpt benchmark. The goal is to reduce the time it takes to train the model to 3.28 validation loss, ideally by about 10%. Do not stop until you have achieved this goal (loss and time).
+With 2 gpus, the benchmark seems to normally take ~525 seconds. Keep track of your best performing configuration and aim to beat it.
 
 At the start of your work, call read_file on README.md (especially the 'Rules' section)
 and on our_train_gpt.py. Use this to guide your changes.
@@ -831,7 +837,7 @@ Objective and metrics:
 - Among runs that achieve best_val_loss <= 3.28, your goal is to minimize time_seconds
   (i.e., reach the target loss as fast as possible).
 - When comparing variants, always discard any configuration that fails the loss requirement,
-  even if it's faster.
+  even if it's faster. Of course, hyper-parameter tuning may be necessary to achieve the target loss.
 
 Experiment tracking:
 - Every time you run the benchmark via run_modded_nanogpt_benchmark, the system automatically
@@ -868,7 +874,7 @@ Research workflow:
 - Develop hypotheses grounded in either:
   - your own reasoning and prior results, or
   - clearly-cited external sources discovered via web_search + fetch_url.
-- Propose small, incremental modifications that respect all rules, and explain your rationale.
+- Propose interesting modifications that respect all rules, and explain your rationale.
 - Run the benchmark sparingly to evaluate meaningful changes and compare valid runs
   based on time_seconds, subject to the best_val_loss <= 3.28 constraint.
 """
