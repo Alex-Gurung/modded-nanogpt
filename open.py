@@ -798,7 +798,7 @@ def build_agent(llm: LLM) -> Agent:
         tools=tools,
         summarize_memory=True,
         memory_window=10,  # keep last 10 tool/explanation messages
-        summary_prompt="Summarize prior research, experiments, hyperparams tried, and results.",
+        summary_prompt="Summarize prior research, experiments, hyperparams tried, and results. Be absolutely certain you're maintaining your knowledge of the rules and constraints, checking README.md and our_train_gpt.py to ensure you're not violating any rules and optimizing the appropriate metrics.",
     )
 
 
@@ -825,7 +825,7 @@ At the start of your work, call read_file on README.md (especially the 'Rules' s
 and on our_train_gpt.py. Use this to guide your changes.
 
 Hard constraints:
-- You may ONLY modify a single file: our_train_gpt.py in the repository root.
+- You may ONLY modify a single file: our_train_gpt.py in the repository root. Note that train_gpt.py is the original training script and is not allowed to be modified.
 - You MUST NOT modify any data scripts, validation scripts, benchmark scripts, or the README.
 - You MUST obey the rules in README.md under the 'Rules' section, including:
   - Do not change the underlying train/validation token streams.
