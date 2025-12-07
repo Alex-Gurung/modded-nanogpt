@@ -755,6 +755,7 @@ class ReadHistoryTool(ToolDefinition[ReadHistoryAction, ReadHistoryObservation])
 register_tool("read_benchmark_history", ReadHistoryTool)
 
 
+
 # =============================================================================
 # LLM & Agent builders
 # =============================================================================
@@ -795,6 +796,9 @@ def build_agent(llm: LLM) -> Agent:
     return Agent(
         llm=llm,
         tools=tools,
+        summarize_memory=True,
+        memory_window=10,  # keep last 10 tool/explanation messages
+        summary_prompt="Summarize prior research, experiments, hyperparams tried, and results.",
     )
 
 
@@ -887,6 +891,9 @@ Research workflow:
 
     conversation.run()
     print("Agent finished.")
+
+    assert llm.metrics is not None
+    print(f"Final LLM metrics: {llm.metrics.model_dump()}")
 
 
 if __name__ == "__main__":
