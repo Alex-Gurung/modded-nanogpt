@@ -1,0 +1,12 @@
+kubectl cp alexgurung-verif-mdjbp-7d45c:/mnt/disk/modded-nanogpt/logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/train_time_series.png logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/train_time_series.png
+kubectl cp alexgurung-verif-mdjbp-7d45c:/mnt/disk/modded-nanogpt/logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/train_di_zsl.png logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/train_di_zsl.png
+kubectl cp alexgurung-verif-mdjbp-7d45c:/mnt/disk/modded-nanogpt/logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/train_di_grad_layerlines.png logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/train_di_grad_layerlines.png
+kubectl cp alexgurung-verif-mdjbp-7d45c:/mnt/disk/modded-nanogpt/logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/train_di_grad_type_lines.png logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/train_di_grad_type_lines.png
+kubectl cp alexgurung-verif-mdjbp-7d45c:/mnt/disk/modded-nanogpt/logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/loss_landscape_step0.png logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/loss_landscape_step0.png
+kubectl cp alexgurung-verif-mdjbp-7d45c:/mnt/disk/modded-nanogpt/logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/loss_landscape_step20.png logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/loss_landscape_step20.png
+kubectl cp alexgurung-verif-mdjbp-7d45c:/mnt/disk/modded-nanogpt/logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/loss_landscape_step40.png logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/loss_landscape_step40.png
+kubectl cp alexgurung-verif-mdjbp-7d45c:/mnt/disk/modded-nanogpt/logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/loss_landscape_step60.png logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/loss_landscape_step60.png
+kubectl cp alexgurung-verif-mdjbp-7d45c:/mnt/disk/modded-nanogpt/logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/calibration_scatter.png logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/calibration_scatter.png
+
+
+kubectl cp alexgurung-verif-mdjbp-7d45c:/mnt/disk/modded-nanogpt/logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/train_di_layer_grid.png logs/90451049-da83-4d04-8b5b-924792093fe6_train_mistakes_plots/train_di_layer_grid.png
