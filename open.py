@@ -772,7 +772,7 @@ def build_llm() -> LLM:
     return LLM(
         model=model,
         api_key=os.getenv("LLM_API_KEY", "dummy"),
-        base_url=os.getenv("LLM_BASE_URL"),  # e.g. http://localhost:8000/v1
+        base_url="http://localhost:8000/v1",
     )
 
 
