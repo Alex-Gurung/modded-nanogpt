@@ -758,13 +758,9 @@ def build_llm() -> LLM:
     """Build the LLM client (assumes OpenAI-compatible endpoint, e.g. vLLM)."""
     raw_model = os.getenv("LLM_MODEL", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
 
-    # Litellm needs a provider prefix (e.g. 'openai/…') to know which backend to use.
-    # vLLM, however, expects the *bare* model name in the JSON.
-    # Using 'openai/<your-model>' satisfies both:
-    # - litellm sees provider 'openai'
-    # - the JSON 'model' field sent to your vLLM server is 'Qwen/Qwen3-Coder-30B-A3B-Instruct'.
+    # Add an OpenAI provider prefix so litellm knows which backend to use,
+    # but vLLM will still see the bare model name in the JSON.
     if "/" not in raw_model.split("/", 1)[0]:
-        # No provider prefix present; assume we want an OpenAI-compatible endpoint
         model = f"openai/{raw_model}"
     else:
         model = raw_model
@@ -772,7 +768,8 @@ def build_llm() -> LLM:
     return LLM(
         model=model,
         api_key=os.getenv("LLM_API_KEY", "dummy"),
-        base_url="http://localhost:8000/v1",
+        base_url="http://localhost:8000/v1",  # your vLLM endpoint
+        native_tool_calling=False,            # 👈 IMPORTANT: disable OpenAI native tools
     )
 
 
