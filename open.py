@@ -777,7 +777,7 @@ def build_llm() -> LLM:
         api_key=os.getenv("LLM_API_KEY", "dummy"),   # vLLM ignores this
         base_url="http://localhost:8000/v1",         # your vLLM OpenAI endpoint
         native_tool_calling=True,                    # ✅ let OpenHands use OpenAI tools properly
-        tool_format="qwen3_xml",                     # ✅ use Qwen3 XML tool format
+        # tool_format="qwen3_xml",                     # ✅ use Qwen3 XML tool format
     )
 
 
