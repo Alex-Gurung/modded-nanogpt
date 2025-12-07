@@ -770,7 +770,7 @@ def build_llm() -> LLM:
     #     model = f"openai/{raw_model}"
     # else:
     #     model = raw_model
-    model = "openai/Qwen3-Coder-30B-A3B-Instruct"
+    model = "openai/Qwen/Qwen3-Coder-30B-A3B-Instruct"
 
     return LLM(
         model=model,
@@ -778,6 +778,7 @@ def build_llm() -> LLM:
         base_url="http://localhost:8000/v1",         # your vLLM OpenAI endpoint
         native_tool_calling=True,                    # ✅ let OpenHands use OpenAI tools properly
         # tool_format="qwen3_xml",                     # ✅ use Qwen3 XML tool format
+        timeout=600,
     )
 
 
