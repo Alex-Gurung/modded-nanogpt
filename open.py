@@ -762,20 +762,22 @@ register_tool("read_benchmark_history", ReadHistoryTool)
 
 def build_llm() -> LLM:
     """Build the LLM client (assumes OpenAI-compatible endpoint, e.g. vLLM)."""
-    raw_model = os.getenv("LLM_MODEL", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
+    # raw_model = os.getenv("LLM_MODEL", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
 
     # Give litellm a provider prefix so it knows how to route the call.
     # vLLM will still see the bare model name "Qwen/Qwen3-Coder-30B-A3B-Instruct".
-    if "/" not in raw_model.split("/", 1)[0]:
-        model = f"openai/{raw_model}"
-    else:
-        model = raw_model
+    # if "/" not in raw_model.split("/", 1)[0]:
+    #     model = f"openai/{raw_model}"
+    # else:
+    #     model = raw_model
+    model = "openai/Qwen3-Coder-30B-A3B-Instruct"
 
     return LLM(
         model=model,
         api_key=os.getenv("LLM_API_KEY", "dummy"),   # vLLM ignores this
         base_url="http://localhost:8000/v1",         # your vLLM OpenAI endpoint
         native_tool_calling=True,                    # ✅ let OpenHands use OpenAI tools properly
+        tool_format="qwen3_xml",                     # ✅ use Qwen3 XML tool format
     )
 
 
