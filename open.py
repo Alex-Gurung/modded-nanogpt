@@ -25,7 +25,7 @@ from openhands.sdk.tool import Tool, ToolExecutor, register_tool
 # Config & globals
 # =============================================================================
 
-# Only this file is writable by the agent
+# Only this file is writable by the agent (core loop lives in agent_core/)
 ALLOWED_WRITE_PATHS = {"our_train_gpt.py"}
 
 # Command used to run the modded-nanogpt benchmark
