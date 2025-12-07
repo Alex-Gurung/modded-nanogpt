@@ -115,7 +115,6 @@ def _parse_hp_config(stdout: str) -> dict:
         line = line.strip()
         if not line.startswith("HP_CONFIG_JSON"):
             continue
-        # Everything after the token should be JSON
         json_part = line[len("HP_CONFIG_JSON"):].strip()
         if not json_part:
             continue
@@ -213,7 +212,6 @@ def _append_benchmark_record(
         with open(history_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(record) + "\n")
     except Exception as e:
-        # Don't crash the tool if logging fails; just print to stderr
         print(f"[WARN] Failed to append benchmark record: {e}", flush=True)
 
 
@@ -243,13 +241,15 @@ class SafeWriteExecutor(ToolExecutor[SafeWriteAction, SafeWriteObservation]):
     Executor for safe_write_file: only allows overwriting our_train_gpt.py.
     """
 
-    async def run(
+    def __init__(self, workspace_root: str):
+        self.workspace_root = workspace_root
+
+    def __call__(
         self,
         action: SafeWriteAction,
-        workspace,
-        **kwargs,
-    ) -> SafeWriteObservation:
-        root = workspace.root_path
+        conversation=None,
+    ) -> SafeWriteObservation:  # noqa: ARG002
+        root = self.workspace_root
         if not _is_path_allowed(root, action.path):
             raise ValueError(
                 f"Editing path '{action.path}' is not allowed. Only our_train_gpt.py may be edited."
@@ -264,18 +264,26 @@ class SafeWriteExecutor(ToolExecutor[SafeWriteAction, SafeWriteObservation]):
         return SafeWriteObservation(message=f"Wrote {action.path}")
 
 
-safe_write_tool_def = ToolDefinition(
-    name="safe_write_file",
-    description=(
-        "Overwrite our_train_gpt.py with new contents. "
-        "Only this file is writable; all other paths will be rejected."
-    ),
-    action_type=SafeWriteAction,
-    observation_type=SafeWriteObservation,
-    executor=SafeWriteExecutor(),
-)
+def _make_safe_write_tool(conv_state) -> list[ToolDefinition]:
+    """
+    Factory for safe_write_file ToolDefinition, bound to the current workspace.
+    """
+    root = conv_state.workspace.working_dir
+    executor = SafeWriteExecutor(workspace_root=root)
+    tool_def = ToolDefinition(
+        name="safe_write_file",
+        description=(
+            "Overwrite our_train_gpt.py with new contents. "
+            "Only this file is writable; all other paths will be rejected."
+        ),
+        action_type=SafeWriteAction,
+        observation_type=SafeWriteObservation,
+        executor=executor,
+    )
+    return [tool_def]
 
-SafeFileTool = register_tool(safe_write_tool_def)
+
+register_tool("safe_write_file", _make_safe_write_tool)
 
 
 # =============================================================================
@@ -299,13 +307,15 @@ class ReadFileExecutor(ToolExecutor[ReadFileAction, ReadFileObservation]):
     Executor for read_file: read and return the contents of a project file.
     """
 
-    async def run(
+    def __init__(self, workspace_root: str):
+        self.workspace_root = workspace_root
+
+    def __call__(
         self,
         action: ReadFileAction,
-        workspace,
-        **kwargs,
-    ) -> ReadFileObservation:
-        root = workspace.root_path
+        conversation=None,
+    ) -> ReadFileObservation:  # noqa: ARG002
+        root = self.workspace_root
         abs_path = os.path.abspath(os.path.join(root, action.path))
         if not os.path.exists(abs_path):
             return ReadFileObservation(content=f"[ERROR] File not found: {action.path}")
@@ -315,21 +325,25 @@ class ReadFileExecutor(ToolExecutor[ReadFileAction, ReadFileObservation]):
         except UnicodeDecodeError:
             return ReadFileObservation(content=f"[ERROR] Failed to decode file as text: {action.path}")
 
-        # Truncate to keep context manageable
         if len(text) > 8000:
             text = text[:8000] + "\n...[truncated]..."
         return ReadFileObservation(content=text)
 
 
-read_file_tool_def = ToolDefinition(
-    name="read_file",
-    description="Read text from a project file (README.md, our_train_gpt.py, etc.).",
-    action_type=ReadFileAction,
-    observation_type=ReadFileObservation,
-    executor=ReadFileExecutor(),
-)
+def _make_read_file_tool(conv_state) -> list[ToolDefinition]:
+    root = conv_state.workspace.working_dir
+    executor = ReadFileExecutor(workspace_root=root)
+    tool_def = ToolDefinition(
+        name="read_file",
+        description="Read text from a project file (README.md, our_train_gpt.py, etc.).",
+        action_type=ReadFileAction,
+        observation_type=ReadFileObservation,
+        executor=executor,
+    )
+    return [tool_def]
 
-ReadFileTool = register_tool(read_file_tool_def)
+
+register_tool("read_file", _make_read_file_tool)
 
 
 # =============================================================================
@@ -373,16 +387,17 @@ class RunBenchmarkExecutor(ToolExecutor[RunBenchmarkAction, RunBenchmarkObservat
     with a fixed environment and parses BENCH_RESULT + HP_CONFIG_JSON.
     """
 
-    async def run(
+    def __init__(self, workspace_root: str):
+        self.workspace_root = workspace_root
+
+    def __call__(
         self,
         action: RunBenchmarkAction,
-        workspace,
-        **kwargs,
-    ) -> RunBenchmarkObservation:
-        root = workspace.root_path
+        conversation=None,
+    ) -> RunBenchmarkObservation:  # noqa: ARG002
+        root = self.workspace_root
 
         env = dict(os.environ)
-        # Adjust GPU layout as desired; this just defaults to the first 2 GPUs
         env.setdefault("CUDA_VISIBLE_DEVICES", "0,1")
 
         proc = subprocess.run(
@@ -399,7 +414,6 @@ class RunBenchmarkExecutor(ToolExecutor[RunBenchmarkAction, RunBenchmarkObservat
 
         parsed = _parse_benchmark_score(stdout)
         if parsed is None:
-            # Log even failed parses so we can debug weird runs
             _append_benchmark_record(
                 workspace_root=root,
                 time_seconds=None,
@@ -416,7 +430,6 @@ class RunBenchmarkExecutor(ToolExecutor[RunBenchmarkAction, RunBenchmarkObservat
 
         time_s, best_val = parsed
 
-        # Log this run in the history file
         _append_benchmark_record(
             workspace_root=root,
             time_seconds=time_s,
@@ -433,19 +446,24 @@ class RunBenchmarkExecutor(ToolExecutor[RunBenchmarkAction, RunBenchmarkObservat
         )
 
 
-run_bench_tool_def = ToolDefinition(
-    name="run_modded_nanogpt_benchmark",
-    description=(
-        "Run the full modded-nanogpt benchmark (torchrun our_train_gpt.py) and return "
-        "time_seconds and best_val_loss parsed from stdout. Also logs a record to "
-        "agent_logs/benchmark_runs.jsonl."
-    ),
-    action_type=RunBenchmarkAction,
-    observation_type=RunBenchmarkObservation,
-    executor=RunBenchmarkExecutor(),
-)
+def _make_run_bench_tool(conv_state) -> list[ToolDefinition]:
+    root = conv_state.workspace.working_dir
+    executor = RunBenchmarkExecutor(workspace_root=root)
+    tool_def = ToolDefinition(
+        name="run_modded_nanogpt_benchmark",
+        description=(
+            "Run the full modded-nanogpt benchmark (torchrun our_train_gpt.py) and return "
+            "time_seconds and best_val_loss parsed from stdout. Also logs a record to "
+            "agent_logs/benchmark_runs.jsonl."
+        ),
+        action_type=RunBenchmarkAction,
+        observation_type=RunBenchmarkObservation,
+        executor=executor,
+    )
+    return [tool_def]
 
-RunBenchmarkTool = register_tool(run_bench_tool_def)
+
+register_tool("run_modded_nanogpt_benchmark", _make_run_bench_tool)
 
 
 # =============================================================================
@@ -470,16 +488,14 @@ class WebSearchObservation(Observation):
 class WebSearchExecutor(ToolExecutor[WebSearchAction, WebSearchObservation]):
     """
     Executor for web_search: uses Tavily's /search API to retrieve a small
-    set of results (title/url/snippet). Uses a global call budget to avoid
-    burning all credits.
+    set of results (title/url/snippet). Uses a global call budget.
     """
 
-    async def run(
+    def __call__(
         self,
         action: WebSearchAction,
-        workspace,
-        **kwargs,
-    ) -> WebSearchObservation:
+        conversation=None,
+    ) -> WebSearchObservation:  # noqa: ARG002
         global _tavily_calls_used
 
         api_key = os.getenv("TAVILY_API_KEY")
@@ -499,7 +515,7 @@ class WebSearchExecutor(ToolExecutor[WebSearchAction, WebSearchObservation]):
             "api_key": api_key,
             "query": action.query,
             "max_results": min(action.top_k, 10),
-            "search_depth": "basic",  # cheaper than 'advanced'
+            "search_depth": "basic",
             "include_answer": False,
         }
 
@@ -526,18 +542,22 @@ class WebSearchExecutor(ToolExecutor[WebSearchAction, WebSearchObservation]):
         return WebSearchObservation(results="\n".join(lines))
 
 
-web_search_def = ToolDefinition(
-    name="web_search",
-    description=(
-        "Search the web using Tavily for research papers, ML optimizations, code ideas, etc. "
-        "Use sparingly; there is a limited web research budget (TAVILY_MAX_CALLS)."
-    ),
-    action_type=WebSearchAction,
-    observation_type=WebSearchObservation,
-    executor=WebSearchExecutor(),
-)
+def _make_web_search_tool(conv_state) -> list[ToolDefinition]:  # noqa: ARG001
+    executor = WebSearchExecutor()
+    tool_def = ToolDefinition(
+        name="web_search",
+        description=(
+            "Search the web using Tavily for research papers, ML optimizations, code ideas, etc. "
+            "Use sparingly; there is a limited web research budget (TAVILY_MAX_CALLS)."
+        ),
+        action_type=WebSearchAction,
+        observation_type=WebSearchObservation,
+        executor=executor,
+    )
+    return [tool_def]
 
-WebSearchTool = register_tool(web_search_def)
+
+register_tool("web_search", _make_web_search_tool)
 
 
 # =============================================================================
@@ -562,12 +582,11 @@ class FetchUrlExecutor(ToolExecutor[FetchUrlAction, FetchUrlObservation]):
     clean text content from a URL. Shares the same call budget as web_search.
     """
 
-    async def run(
+    def __call__(
         self,
         action: FetchUrlAction,
-        workspace,
-        **kwargs,
-    ) -> FetchUrlObservation:
+        conversation=None,
+    ) -> FetchUrlObservation:  # noqa: ARG002
         global _tavily_calls_used
 
         api_key = os.getenv("TAVILY_API_KEY")
@@ -604,15 +623,19 @@ class FetchUrlExecutor(ToolExecutor[FetchUrlAction, FetchUrlObservation]):
         return FetchUrlObservation(content=text)
 
 
-fetch_url_def = ToolDefinition(
-    name="fetch_url",
-    description="Fetch and extract clean text content from a URL using Tavily.",
-    action_type=FetchUrlAction,
-    observation_type=FetchUrlObservation,
-    executor=FetchUrlExecutor(),
-)
+def _make_fetch_url_tool(conv_state) -> list[ToolDefinition]:  # noqa: ARG001
+    executor = FetchUrlExecutor()
+    tool_def = ToolDefinition(
+        name="fetch_url",
+        description="Fetch and extract clean text content from a URL using Tavily.",
+        action_type=FetchUrlAction,
+        observation_type=FetchUrlObservation,
+        executor=executor,
+    )
+    return [tool_def]
 
-FetchUrlTool = register_tool(fetch_url_def)
+
+register_tool("fetch_url", _make_fetch_url_tool)
 
 
 # =============================================================================
@@ -640,13 +663,15 @@ class ReadHistoryExecutor(ToolExecutor[ReadHistoryAction, ReadHistoryObservation
     returns a compact human-readable summary of the most recent runs.
     """
 
-    async def run(
+    def __init__(self, workspace_root: str):
+        self.workspace_root = workspace_root
+
+    def __call__(
         self,
         action: ReadHistoryAction,
-        workspace,
-        **kwargs,
-    ) -> ReadHistoryObservation:
-        root = workspace.root_path
+        conversation=None,
+    ) -> ReadHistoryObservation:  # noqa: ARG002
+        root = self.workspace_root
         history_path = os.path.join(root, RUN_HISTORY_FILE_NAME)
         if not os.path.exists(history_path):
             return ReadHistoryObservation(summary="No benchmark history found yet.")
@@ -668,7 +693,6 @@ class ReadHistoryExecutor(ToolExecutor[ReadHistoryAction, ReadHistoryObservation
         if not rows:
             return ReadHistoryObservation(summary="History file is empty or unreadable.")
 
-        # Take the most recent N rows (file is append-only)
         n = max(1, action.max_rows)
         rows = rows[-n:]
 
@@ -684,25 +708,11 @@ class ReadHistoryExecutor(ToolExecutor[ReadHistoryAction, ReadHistoryObservation
             valid = r.get("valid")
             note = (r.get("note") or "").strip()
 
-            # Try to pull a few key hyperparameters from hp_config.hyperparameters
             hp = r.get("hp_config") or {}
             hargs = hp.get("hyperparameters") or {}
-            lr = None
-            batch_size = None
-            seq_len = None
-            try:
-                # might not exist depending on dataclass fields
-                lr = hargs.get("lr", None)
-            except Exception:
-                pass
-            try:
-                batch_size = hargs.get("train_batch_size", None)
-            except Exception:
-                pass
-            try:
-                seq_len = hargs.get("train_max_seq_len", None)
-            except Exception:
-                pass
+            lr = hargs.get("lr", None) if isinstance(hargs, dict) else None
+            batch_size = hargs.get("train_batch_size", None) if isinstance(hargs, dict) else None
+            seq_len = hargs.get("train_max_seq_len", None) if isinstance(hargs, dict) else None
 
             hp_bits = []
             if lr is not None:
@@ -728,18 +738,23 @@ class ReadHistoryExecutor(ToolExecutor[ReadHistoryAction, ReadHistoryObservation
         return ReadHistoryObservation(summary="\n".join(lines))
 
 
-read_history_def = ToolDefinition(
-    name="read_benchmark_history",
-    description=(
-        "Read a summary of recent benchmark runs, including time, val loss, validity, "
-        "and a few key hyperparameters from HP_CONFIG_JSON."
-    ),
-    action_type=ReadHistoryAction,
-    observation_type=ReadHistoryObservation,
-    executor=ReadHistoryExecutor(),
-)
+def _make_read_history_tool(conv_state) -> list[ToolDefinition]:
+    root = conv_state.workspace.working_dir
+    executor = ReadHistoryExecutor(workspace_root=root)
+    tool_def = ToolDefinition(
+        name="read_benchmark_history",
+        description=(
+            "Read a summary of recent benchmark runs, including time, val loss, validity, "
+            "and a few key hyperparameters from HP_CONFIG_JSON."
+        ),
+        action_type=ReadHistoryAction,
+        observation_type=ReadHistoryObservation,
+        executor=executor,
+    )
+    return [tool_def]
 
-ReadHistoryTool = register_tool(read_history_def)
+
+register_tool("read_benchmark_history", _make_read_history_tool)
 
 
 # =============================================================================
@@ -755,22 +770,23 @@ def build_llm() -> LLM:
     """
     return LLM(
         model=os.getenv("LLM_MODEL", "Qwen/Qwen3-Coder-30B-A3B-Instruct"),
-        api_key=os.getenv("LLM_API_KEY", "dummy"),  # local servers often ignore this
-        base_url=os.getenv("LLM_BASE_URL"),         # e.g. http://localhost:8000/v1
+        api_key=os.getenv("LLM_API_KEY", "dummy"),
+        base_url=os.getenv("LLM_BASE_URL"),  # e.g. http://localhost:8000/v1
     )
 
 
 def build_agent(llm: LLM) -> Agent:
     """
     Construct an Agent with our custom tools.
+    All tools are referenced by name and resolved via the registry.
     """
     tools = [
-        Tool(name=SafeFileTool.name),
-        Tool(name=ReadFileTool.name),
-        Tool(name=RunBenchmarkTool.name),
-        Tool(name=WebSearchTool.name),
-        Tool(name=FetchUrlTool.name),
-        Tool(name=ReadHistoryTool.name),
+        Tool(name="safe_write_file"),
+        Tool(name="read_file"),
+        Tool(name="run_modded_nanogpt_benchmark"),
+        Tool(name="web_search"),
+        Tool(name="fetch_url"),
+        Tool(name="read_benchmark_history"),
     ]
     return Agent(
         llm=llm,
@@ -798,7 +814,6 @@ def main() -> None:
 
     conversation = Conversation(agent=agent, workspace=repo_root)
 
-    # System prompt to shape the agent's behavior
     system_prompt = """
 You are an autonomous research engineer improving the modded-nanogpt benchmark.
 
@@ -863,7 +878,6 @@ Research workflow:
 - Run the benchmark sparingly to evaluate meaningful changes and compare valid runs
   based on time_seconds, subject to the best_val_loss <= 3.28 constraint.
 """
-
     conversation.send_message(system_prompt.strip())
     conversation.send_message(
         "First, inspect README.md and our_train_gpt.py, summarize the rules and current training "
